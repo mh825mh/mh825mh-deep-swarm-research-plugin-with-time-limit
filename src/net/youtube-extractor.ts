@@ -1,4 +1,5 @@
 import { buildBrowserHeaders } from "./http";
+import { ExtractedPage } from "../types";
 
 const INNERTUBE_PLAYER_URL = "https://www.youtube.com/youtubei/v1/player";
 const ANDROID_CLIENT = {
@@ -10,17 +11,45 @@ const ANDROID_CLIENT = {
   },
 };
 
-function extractVideoId(url: string): string | null {
+function isYouTubeHost(hostname: string): boolean {
+  const host = hostname.toLowerCase();
+  return (
+    host === "youtu.be" ||
+    host.endsWith(".youtu.be") ||
+    host === "youtube.com" ||
+    host.endsWith(".youtube.com")
+  );
+}
+
+export function isYouTubeUrl(url: string): boolean {
+  try {
+    return isYouTubeHost(new URL(url).hostname);
+  } catch {
+    return false;
+  }
+}
+
+const VIDEO_ID_RE = /^[A-Za-z0-9_-]{11}$/;
+
+export function extractYouTubeVideoId(url: string): string | null {
+  let id: string | null = null;
   try {
     const u = new URL(url);
-    if (u.hostname.includes("youtu.be")) return u.pathname.slice(1);
-    if (u.searchParams.has("v")) return u.searchParams.get("v");
-    const match = u.pathname.match(/\/(embed|shorts)\/([^\/]+)/);
-    if (match) return match[2];
-    return null;
+    if (!isYouTubeHost(u.hostname)) return null;
+    if (u.hostname.toLowerCase().endsWith("youtu.be")) {
+      id = u.pathname.replace(/^\/+/, "").split(/[/?#]/)[0] || null;
+    } else if (u.searchParams.has("v")) {
+      id = u.searchParams.get("v");
+    } else {
+      const match = u.pathname.match(/\/(?:embed|shorts|live)\/([^/?#]+)/);
+      if (match) id = match[1];
+    }
   } catch {
     return null;
   }
+  if (!id) return null;
+  const trimmed = id.trim();
+  return VIDEO_ID_RE.test(trimmed) ? trimmed : null;
 }
 
 async function fetchInnerTube(
@@ -67,14 +96,10 @@ function pickTrack(tracks: any[]): any | null {
   );
 }
 
-function parseTranscriptXml(
-  xml: string,
-  maxChars: number,
-): { text: string; totalChars: number } | null {
-  const segments: string[] = [];
+function parseTranscriptXml(xml: string): { lines: string[] } | null {
+  const lines: string[] = [];
   const regex = /<text start="([\d.]+)" dur="[\d.]+">([\s\S]*?)<\/text>/g;
   let match: RegExpExecArray | null;
-  let totalChars = 0;
 
   while ((match = regex.exec(xml)) !== null) {
     const startSec = parseFloat(match[1]);
@@ -89,13 +114,10 @@ function parseTranscriptXml(
       .replace(/\n/g, " ")
       .trim();
 
-    const line = `[${mins}:${secs}] ${text}`;
-    if (totalChars + line.length > maxChars) break;
-    segments.push(line);
-    totalChars += line.length;
+    if (text) lines.push(`[${mins}:${secs}] ${text}`);
   }
 
-  return segments.length > 0 ? { text: segments.join("\n"), totalChars } : null;
+  return lines.length > 0 ? { lines } : null;
 }
 
 export async function extractYouTubeTranscript(
@@ -103,7 +125,7 @@ export async function extractYouTubeTranscript(
   signal: AbortSignal,
   maxChars: number = 6000,
 ): Promise<{ text: string; title: string; description: string } | null> {
-  const videoId = extractVideoId(url);
+  const videoId = extractYouTubeVideoId(url);
   if (!videoId) return null;
 
   try {
@@ -140,7 +162,7 @@ export async function extractYouTubeTranscript(
     if (!capRes.ok) return null;
     const xml = await capRes.text();
 
-    const parsed = parseTranscriptXml(xml, maxChars);
+    const parsed = parseTranscriptXml(xml);
     if (!parsed) {
       return {
         text: description.slice(0, maxChars) || "Failed to parse transcript.",
@@ -149,8 +171,18 @@ export async function extractYouTubeTranscript(
       };
     }
 
+    // maxChars is a ceiling on the whole transcript; page-level slicing happens
+    // later in buildYouTubePage so a caller can walk the video in chunks.
+    const kept: string[] = [];
+    let total = 0;
+    for (const line of parsed.lines) {
+      if (total + line.length + 1 > maxChars) break;
+      kept.push(line);
+      total += line.length + 1;
+    }
+
     return {
-      text: parsed.text,
+      text: kept.join("\n"),
       title,
       description,
     };
@@ -158,4 +190,53 @@ export async function extractYouTubeTranscript(
     if (err instanceof DOMException && err.name === "AbortError") throw err;
     return null;
   }
+}
+
+/**
+ * Wrap an extracted transcript in the shared ExtractedPage shape so every
+ * consumer (swarm worker, Read Page, Multi-Read) sees one structure.
+ *
+ * Pages are cut on line boundaries, never mid-line, so a chunk never starts
+ * with a truncated "[MM:SS] ..." fragment. A chunk may overshoot `contentLimit`
+ * by up to one line in exchange for that guarantee.
+ */
+export function buildYouTubePage(
+  url: string,
+  data: { text: string; title: string; description: string },
+  contentLimit: number,
+  page: number = 1,
+): ExtractedPage {
+  const lines = data.text ? data.text.split("\n") : [];
+  const chunks: string[] = [];
+  let current: string[] = [];
+  let currentLen = 0;
+
+  for (const line of lines) {
+    const added = currentLen === 0 ? line.length : currentLen + 1 + line.length;
+    if (current.length > 0 && added > contentLimit) {
+      chunks.push(current.join("\n"));
+      current = [line];
+      currentLen = line.length;
+    } else {
+      current.push(line);
+      currentLen = added;
+    }
+  }
+  if (current.length > 0) chunks.push(current.join("\n"));
+
+  const totalPages = Math.max(1, chunks.length);
+  const text = chunks[page - 1] ?? "";
+
+  return {
+    url,
+    finalUrl: url,
+    title: data.title || url,
+    description: data.description || "",
+    published: null,
+    text,
+    wordCount: text.split(/\s+/).filter(Boolean).length,
+    outlinks: [],
+    page,
+    totalPages,
+  };
 }

@@ -2,7 +2,11 @@
 import { LlmCallManager, askLoadedModel, hasLoadedModel } from "../utils/llm";
 import { logLlmDiagnostics } from "../utils/tokens";
 import { fetchWithWaterfall } from "../net/waterfallFetcher";
-import { extractYouTubeTranscript } from "../net/youtube-extractor";
+import {
+  isYouTubeUrl,
+  extractYouTubeTranscript,
+  buildYouTubePage,
+} from "../net/youtube-extractor";
 import {
   searchSerper,
   searchBraveApi,
@@ -692,21 +696,10 @@ async function fetchAndExtract(
 ): Promise<CrawledSource> {
   let page: ExtractedPage;
 
-  if (/youtube\.com|youtu\.be/i.test(url)) {
+  if (isYouTubeUrl(url)) {
     const ytData = await extractYouTubeTranscript(url, signal, task.contentLimit);
     if (!ytData) throw new Error("YouTube transcript extraction failed");
-    page = {
-      url: url,
-      finalUrl: url,
-      title: ytData.title,
-      description: ytData.description,
-      published: null,
-      text: ytData.text,
-      wordCount: ytData.text.split(/\s+/).filter(Boolean).length,
-      outlinks: [],
-      page: 1,
-      totalPages: 1,
-    };
+    page = buildYouTubePage(url, ytData, task.contentLimit, 1);
   } else {
     const fetchResult = await fetchWithWaybackFallback(url, signal, task);
     const { finalUrl } = fetchResult;

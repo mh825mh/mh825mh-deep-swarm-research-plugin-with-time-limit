@@ -11,6 +11,11 @@ import { fetchPage } from "./net/http";
 import { extractPage } from "./net/extractor";
 import { extractPdf } from "./net/pdf-extractor";
 import {
+  isYouTubeUrl,
+  extractYouTubeTranscript,
+  buildYouTubePage,
+} from "./net/youtube-extractor";
+import {
   getGlobalStore,
   saveGlobalStoreIndex,
   type LibraryPriority,
@@ -33,6 +38,11 @@ import { setDecodoToken } from "./net/decodoApi";
 // Local type definition to satisfy `satisfies` keyword without breaking compilation
 type ToolCallResult = { error: boolean; output: string };
 type PdfImage = any;
+
+// Ceiling for the raw transcript fetch. A long podcast runs to 100k+ chars;
+// we fetch enough for several contentLimit-sized pages and let buildYouTubePage
+// slice the rest.
+const YT_MAX_TRANSCRIPT_CHARS = CONTENT_LIMIT_EXTENDED * 10;
 
 // Local helper functions for missing exports
 function isPdfContentType(ct: string | undefined): boolean {
@@ -605,6 +615,10 @@ const researchSearchTool = tool({
       "with dimensions and size metadata (not inline base64). " +
       "Use this to read individual pages. For reading multiple URLs at once use 'Multi-Read'." +
       "with dimensions and size metadata (not inline base64). " +
+      "YouTube URLs (youtu.be, /watch, /shorts, /embed) are resolved to the " +
+      "video's transcript instead of the bot-blocked watch page. Transcripts are " +
+      "chunked: while 'totalPages' exceeds 'page', call again with the next page " +
+      "number to read the rest of the video before summarizing it. " +
       "Don't use this for reading local files.",
     parameters: {
       url: z.string().url().describe("The URL to visit and read."),
@@ -637,6 +651,48 @@ const researchSearchTool = tool({
       status(`Reading: ${url} (page ${pageNum})`);
 
       try {
+        // YouTube watch pages bot-block the generic fetcher, so transcripts are
+        // pulled via the innerTube API instead. Never let this path report the
+        // misleading "blocked and all archives failed" error.
+        if (isYouTubeUrl(url)) {
+          status(`YouTube URL - fetching transcript (page ${pageNum})...`);
+          const ytData = await extractYouTubeTranscript(
+            url,
+            signal,
+            YT_MAX_TRANSCRIPT_CHARS,
+          );
+          if (ytData) {
+            const ytPage = buildYouTubePage(url, ytData, limit, pageNum);
+            const ytScored = scoreCandidate(
+              { url, title: ytPage.title, snippet: ytPage.description },
+              "",
+            );
+
+            const ytTotalPages = ytPage.totalPages ?? 1;
+            status(
+              ytTotalPages > pageNum
+                ? `Transcript read (${pageNum}/${ytTotalPages}). Call again with page=${pageNum + 1} to continue.`
+                : "Transcript read successfully.",
+            );
+
+            return {
+              url: ytPage.finalUrl,
+              title: ytPage.title,
+              description: ytPage.description,
+              published: ytPage.published,
+              wordCount: ytPage.wordCount,
+              domainScore: ytScored.domainScore,
+              tier: ytScored.tier,
+              content: ytPage.text,
+              page: ytPage.page,
+              totalPages: ytPage.totalPages,
+              topLinks: [],
+              sourceType: "youtube-transcript",
+            };
+          }
+          warn(`YouTube transcript unavailable for ${url}; falling back to page fetch.`);
+        }
+
         const fetchResult = await fetchPage(url, signal);
         const { finalUrl } = fetchResult;
 
@@ -754,6 +810,7 @@ const researchSearchTool = tool({
       "and metadata for all of them. Automatically handles PDF URLs - extracts " +
       "clean text instead of returning garbled binary data. Returns domain authority " +
       "score, publication date, and word count per page. " +
+      "YouTube URLs are resolved to their transcript rather than the watch page. " +
       "Use this when you already have a list of URLs and want to read them all " +
       "at once without running a full research session.",
     parameters: {
@@ -802,6 +859,37 @@ const researchSearchTool = tool({
         const batch = urls.slice(i, i + CONCURRENCY);
         const settled = await Promise.allSettled(
           batch.map(async (url: any, bi: number) => {
+            if (isYouTubeUrl(url)) {
+              const ytData = await extractYouTubeTranscript(
+                url,
+                signal,
+                YT_MAX_TRANSCRIPT_CHARS,
+              );
+              if (ytData) {
+                const ytPage = buildYouTubePage(url, ytData, limit, 1);
+                const ytScored = scoreCandidate(
+                  { url, title: ytPage.title, snippet: ytPage.description },
+                  "",
+                );
+                return {
+                  index: i + bi + 1,
+                  url: ytPage.finalUrl,
+                  title: ytPage.title,
+                  published: ytPage.published,
+                  wordCount: ytPage.wordCount,
+                  domainScore: ytScored.domainScore,
+                  tier: ytScored.tier,
+                  content: ytPage.text,
+                  page: ytPage.page,
+                  totalPages: ytPage.totalPages,
+                  error: null as string | null,
+                };
+              }
+              warn(
+                `YouTube transcript unavailable for ${url}; falling back to page fetch.`,
+              );
+            }
+
             const fetchResult = await fetchPage(url, signal);
             const { finalUrl } = fetchResult;
 
