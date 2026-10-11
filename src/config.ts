@@ -177,4 +177,14 @@ export const configSchematics = createConfigSchematics()
     },
     "30",
   )
+  .field(
+    "includeReasoningAudit",
+    "boolean",
+    {
+      displayName: "Include Reasoning Audit",
+      subtitle:
+        "Append a collapsible 'Swarm Reasoning & Verification Trace' section to the final report.",
+    },
+    true,
+  )
   .build();

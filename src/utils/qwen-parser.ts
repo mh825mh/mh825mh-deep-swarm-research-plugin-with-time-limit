@@ -29,6 +29,24 @@ export function stripThinkTags(raw: string): string {
   return out.replace(ORPHAN_THINK_TAG_RE, "");
 }
 
+/**
+ * Extracts and joins the inner text of every ` thinking...</think>` block
+ * (case-insensitive, multi-line). Used to preserve a reasoning model's chain of
+ * thought in an auditable sidecar instead of letting it leak into the report.
+ * Returns "" when no think block is present.
+ */
+export function extractThinkBlocks(raw: string): string {
+  if (!raw) return "";
+  const blocks: string[] = [];
+  const re = /<think\b[^>]*>([\s\S]*?)<\/think>/gi;
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(raw)) !== null) {
+    const inner = match[1].trim();
+    if (inner) blocks.push(inner);
+  }
+  return blocks.join("\n\n");
+}
+
 /** Strips a single outer ```/```json Markdown fence, matching the legacy paths. */
 function stripCodeFences(text: string): string {
   return text

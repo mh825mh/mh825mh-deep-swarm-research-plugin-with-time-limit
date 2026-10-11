@@ -216,3 +216,21 @@ export const SYSTEM_INSTRUCTIONS = `You are a core component of the Deep Swarm R
 Your goal is to provide precise, high-quality research planning, task decomposition, and findings synthesis.
 Be analytical and objective. Avoid conversational filler. Follow the requested output format strictly.
 When generating search queries, ensure they are diverse, targeted, and effective for finding high-authority information.`;
+
+/**
+ * Cognitive-scaffolding rubric injected into system prompts for phases that run
+ * with reasoning enabled (planner, synthesis). It guides the model's ` thinking`
+ * trace through source auditing, falsification, corroboration, and outlining so
+ * the reasoning is structured rather than free-form.
+ */
+export const THINKING_PROTOCOL = `[THINKING PROTOCOL]
+Before producing your final answer, reason through these milestones in order:
+1. SOURCE CREDIBILITY & RECENCY AUDIT - weigh each source's authority, methodology, and publication date; discount undated or low-tier claims.
+2. FALSIFICATION & COUNTER-CLAIM CHECKING - actively look for evidence that contradicts the emerging answer, including failed replications and dissenting experts.
+3. CORROBORATION VERIFICATION - require that load-bearing claims appear in multiple independent domains, not a single cluster of mutually-citing pages.
+4. REPORT STRUCTURE OUTLINE - plan the final structure (summary, sections, reference appendix) before writing.`;
+
+/** Max unresolved questions mined from the planner's reasoning trace per run. */
+export const UNCERTAINTY_MAX_QUERIES = 3;
+/** Per-worker page budget for the epistemic-uncertainty mining round. */
+export const UNCERTAINTY_PAGE_BUDGET = 4;

@@ -1,6 +1,7 @@
 import { runWorker, CrawlMetrics } from "./worker";
 import { SwarmBlackboard } from "./blackboard";
 import { topicNeedsLocalSources } from "../local/gatekeeper";
+import { extractUncertaintyQueries } from "./uncertainty-miner";
 import {
   buildQueryPlan,
   buildAdaptiveGapFill,
@@ -23,7 +24,7 @@ import {
   SkillPack,
   BlockedUrlEntry,
 } from "../types";
-import { DepthProfile, CRITIC_RETRY_MAX_TASKS, CRITIC_RETRY_PAGE_BUDGET } from "../constants";
+import { DepthProfile, CRITIC_RETRY_MAX_TASKS, CRITIC_RETRY_PAGE_BUDGET, UNCERTAINTY_MAX_QUERIES, UNCERTAINTY_PAGE_BUDGET } from "../constants";
 import { DdgLimiterPool, resetThrottle } from "../net/ddg";
 import { resetArchiveSession, getArchiveState } from "../net/http";
 import { VisitedPageCache, normalizeUrl, type VisitedCacheStats } from "./visited-cache";
@@ -470,6 +471,10 @@ export interface OrchestratorResult {
   readonly domainTags?: ReadonlyArray<string>;
   /** Auto-selected skill pack applied to critic + synthesis prompts. */
   readonly skill?: SkillPack;
+  /** Raw ` thinking` reasoning trace captured from the planner. */
+  readonly plannerReasoning?: string;
+  /** Unresolved questions mined from the planner trace and searched in Round 2. */
+  readonly minedUncertaintyQueries?: ReadonlyArray<string>;
   readonly blackboardSnapshot?: import("./blackboard").BlackboardSnapshot;
   readonly runStats?: {
     readonly ddgState: EngineState;
@@ -797,6 +802,69 @@ void memoryContext;
     if (layer === "API") health.apiCallsMade++;
   }
 
+  // ==========================================
+  // EPISTEMIC UNCERTAINTY MINING (DeepThink)
+  // ==========================================
+  // The planner runs with reasoning enabled. Mine the unresolved questions it
+  // flagged in its ` thinking` trace, dedupe them against everything already
+  // searched, and run one bounded extra search wave before the final cap and
+  // the critic so the new sources are graded into the same ledger.
+  const plannerReasoning = plan.plannerReasoning ?? "";
+  let minedUncertaintyQueries: ReadonlyArray<string> = [];
+  if (
+    plannerReasoning &&
+    !signal.aborted &&
+    !llmManager.signal.aborted &&
+    Date.now() < crawlDeadline
+  ) {
+    const alreadySearched = new Set(allQueries.map((q) => q.toLowerCase()));
+    minedUncertaintyQueries = extractUncertaintyQueries(
+      plannerReasoning,
+      cfg.topic,
+    )
+      .filter((q) => !alreadySearched.has(q.toLowerCase()))
+      .slice(0, UNCERTAINTY_MAX_QUERIES);
+
+    if (minedUncertaintyQueries.length > 0) {
+      fileStatus(
+        `\n🧠 EPISTEMIC UNCERTAINTY: planner flagged ${minedUncertaintyQueries.length} unresolved question(s) — launching targeted mining round...`,
+      );
+      const uncertaintyTasks = buildGapTasks(
+        [
+          {
+            role: "critical",
+            label: `Uncertainty Mining: ${minedUncertaintyQueries[0].slice(0, 60)}`,
+            queries: minedUncertaintyQueries,
+            followLinks: false,
+          } satisfies GapPlanLike,
+        ],
+        2,
+        profile,
+        cfg,
+      ).map((t) => ({ ...t, pageBudget: UNCERTAINTY_PAGE_BUDGET }));
+
+      const beforeMining = allSources.length;
+      const miningResults = await runTaskGroup(
+        uncertaintyTasks,
+        state,
+        pool,
+        signal,
+        fileStatus,
+        fileWarn,
+        plan.topicKeywords,
+        health,
+        llmManager,
+      );
+      aggregateResults(miningResults, allSources, allQueries, allErrors);
+      const miningAdded = allSources.length - beforeMining;
+      fileStatus(
+        miningAdded > 0
+          ? `✅ [UNCERTAINTY] Mining round added ${miningAdded} new source(s).`
+          : `[UNCERTAINTY] Mining round found no new sources.`,
+      );
+    }
+  }
+
   // Cap Sources to Top-N before logging and passing to synthesis
   const sortedSources = [...allSources].sort((a, b) => {
     const scoreA = (a.domainScore * 0.4) + (a.relevanceScore * 100 * 0.6);
@@ -1029,6 +1097,9 @@ void memoryContext;
     runStats: buildRunStats(health, llmManager, state, runStartedAt, sessionLimitMs, effectiveRuntimeMs, criticCallsUsed, criticRetrySourcesAdded),
     domainTags: plan.domainTags,
     skill,
+    plannerReasoning: plannerReasoning || undefined,
+    minedUncertaintyQueries:
+      minedUncertaintyQueries.length > 0 ? minedUncertaintyQueries : undefined,
     blackboardSnapshot: blackboard.snapshot(),
   };
 }

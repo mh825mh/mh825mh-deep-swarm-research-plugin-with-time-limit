@@ -6,7 +6,13 @@
 
 import { runSwarm } from "./swarm/orchestrator";
 import { buildReport } from "./report/builder";
-import { ResearchConfig, ResearchResult, StatusFn, WarnFn } from "./types";
+import {
+  ResearchConfig,
+  ResearchResult,
+  IResearchRunRecord,
+  StatusFn,
+  WarnFn,
+} from "./types";
 import { getDepthProfile } from "./constants";
 
 /**
@@ -62,7 +68,12 @@ export async function runDeepResearch(
     cfg.manualContextLimit ?? 8192,
     cfg.maxSynthesisInputTokens ?? 18000,
     swarmResult.gradedCards,
-    swarmResult.skill
+    swarmResult.skill,
+    cfg.includeReasoningAudit ?? true,
+    {
+      planner: swarmResult.plannerReasoning,
+      minedQueries: swarmResult.minedUncertaintyQueries,
+    },
   );
 
   status(
@@ -83,11 +94,28 @@ export async function runDeepResearch(
     ? `${report.markdown.trim()}\n\n${footer}`
     : report.markdown;
 
+  const reasoningTrace = {
+    planner: swarmResult.plannerReasoning,
+    synthesis: report.reasoningTrace,
+    minedQueries: swarmResult.minedUncertaintyQueries,
+  };
+  const hasTrace =
+    Boolean(reasoningTrace.planner) ||
+    Boolean(reasoningTrace.synthesis) ||
+    (reasoningTrace.minedQueries?.length ?? 0) > 0;
+  const metadata: IResearchRunRecord = {
+    runId: String(Date.now()),
+    topic: cfg.topic,
+    timestamp: new Date().toUTCString(),
+    reasoningTrace: hasTrace ? reasoningTrace : undefined,
+  };
+
   return {
     report: { ...report, markdown: finalMarkdown },
     queriesUsed: swarmResult.queriesUsed,
     totalSources: swarmResult.sources.length,
     totalRounds: profile.depthRounds,
+    metadata,
   };
 }
 

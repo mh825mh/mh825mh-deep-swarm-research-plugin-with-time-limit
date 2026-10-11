@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { extractQwenJson, stripThinkTags } from "../src/utils/qwen-parser";
+import { extractQwenJson, stripThinkTags, extractThinkBlocks } from "../src/utils/qwen-parser";
 
 describe("stripThinkTags", () => {
   it("removes think blocks case-insensitively and across newlines", () => {
@@ -17,8 +17,27 @@ describe("stripThinkTags", () => {
   });
 
   it("sweeps up unbalanced tags left by nested blocks", () => {
-    const raw = "<think>outer <think>inner</think> tail</think>";
+    const raw = "outer<think>outer <think>inner</think> tail</think>";
     expect(stripThinkTags(raw).includes("think")).toBe(false);
+  });
+});
+
+describe("extractThinkBlocks", () => {
+  it("returns the inner text of a single think block", () => {
+    expect(extractThinkBlocks("a <think>reasoning here</think> b")).toBe(
+      "reasoning here",
+    );
+  });
+
+  it("joins multiple think blocks and ignores non-think text", () => {
+    expect(
+      extractThinkBlocks("<think>Premise.</think> Between. <think>Conclusion.</think>"),
+    ).toBe("Premise.\n\nConclusion.");
+  });
+
+  it("returns an empty string when no think block is present", () => {
+    expect(extractThinkBlocks("just an answer")).toBe("");
+    expect(extractThinkBlocks("")).toBe("");
   });
 });
 

@@ -90,6 +90,7 @@ function readConfig(ctl: any) {
     maxExternalToolCalls: 0,
     requireApprovalForWrites: false,
     llmConcurrency: 1,
+    includeReasoningAudit: true,
       };
 
   const tryGet = (p: any, key: string): unknown => {
@@ -140,6 +141,7 @@ function readConfig(ctl: any) {
           maxExternalToolCalls: tryGet(parsed, "maxExternalToolCalls"),
           requireApprovalForWrites: tryGet(parsed, "requireApprovalForWrites"),
           llmConcurrency: tryGet(parsed, "llmConcurrency"),
+          includeReasoningAudit: tryGet(parsed, "includeReasoningAudit"),
         };
       }
     } catch {
@@ -288,6 +290,7 @@ function readConfig(ctl: any) {
       maxExternalToolCalls: Math.max(0, Number(cfg.maxExternalToolCalls ?? fallback.maxExternalToolCalls)),
       requireApprovalForWrites: on(cfg.requireApprovalForWrites, fallback.requireApprovalForWrites),
       llmConcurrency: Math.max(1, Math.min(8, Number(cfg.llmConcurrency ?? fallback.llmConcurrency))),
+      includeReasoningAudit: on(cfg.includeReasoningAudit, fallback.includeReasoningAudit),
     };
   } catch {
     return fallback;
@@ -452,6 +455,7 @@ const result = await runDeepResearch(
     blockedDomains: ui.blockedDomains,
     maxPdfBytes: ui.maxPdfBytes,
     llmConcurrency: ui.llmConcurrency,
+    includeReasoningAudit: ui.includeReasoningAudit,
   },
   status,
   warn,

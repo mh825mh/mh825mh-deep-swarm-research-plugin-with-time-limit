@@ -2,7 +2,11 @@
 import { LMStudioClient } from "@lmstudio/sdk";
 import { ReportSource, ContradictionEntry, StatusFn, EvidenceCard, GradedEvidenceCard, ContextBudget, SkillPack } from "../types";
 import { logLlmDiagnostics, estimateTokens, preflightSynthesis } from "../utils/tokens";
-import { buildPredictionOptions, withThinkingDirective } from "../utils/llm";
+import {
+  buildPredictionOptions,
+  withThinkingDirective,
+  collectPredictionStream,
+} from "../utils/llm";
 import { boundEvidenceChunk } from "../utils/text";
 import {
   DepthProfile,
@@ -11,7 +15,17 @@ import {
   CONTRADICTION_SOURCE_CHARS,
   CONTRADICTION_MAX_SOURCES,
   SYSTEM_INSTRUCTIONS,
+  THINKING_PROTOCOL,
 } from "../constants";
+
+/** Synthesis system prompt: base engine instructions plus the thinking rubric. */
+const SYNTHESIS_SYSTEM = `${SYSTEM_INSTRUCTIONS}\n\n${THINKING_PROTOCOL}`;
+
+/** Narrative synthesis text plus the reasoning trace the model emitted. */
+export interface SynthesisResult {
+  readonly text: string;
+  readonly reasoning: string;
+}
 
 function renderVerdict(card: GradedEvidenceCard): string {
   const c = card.critic;
@@ -61,7 +75,7 @@ export async function synthesiseReport(
   status: StatusFn,
   budget: ContextBudget,
   skill?: SkillPack,
-): Promise<string | null> {
+): Promise<SynthesisResult | null> {
   if (evidence.length === 0) return null;
 
   status(`AI synthesis - preparing evidence ledger (${evidence.length} cards, budget: ${budget.maxSynthesisInput} tokens)…`);
@@ -115,7 +129,7 @@ SYNTHESIS:`;
 
     const messages = withThinkingDirective(
       [
-        { role: "system" as const, content: SYSTEM_INSTRUCTIONS },
+        { role: "system" as const, content: SYNTHESIS_SYSTEM },
         { role: "user" as const, content: prompt },
       ],
       { reasoningEffort: "medium" },
@@ -129,12 +143,10 @@ SYNTHESIS:`;
       }) as never,
     );
 
-    let result = "";
-    for await (const chunk of stream) result += chunk.content ?? "";
-
-    if (result.length > 100) {
-      status(`AI synthesis complete (${result.length} chars)`);
-      return result;
+    const collected = await collectPredictionStream(stream as never);
+    if (collected.text.length > 100) {
+      status(`AI synthesis complete (${collected.text.length} chars)`);
+      return { text: collected.text, reasoning: collected.reasoning };
     }
     return null;
   } catch (err) {

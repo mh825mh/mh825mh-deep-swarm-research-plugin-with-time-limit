@@ -2,7 +2,63 @@
 import { LMStudioClient } from "@lmstudio/sdk";
 import { z } from "zod";
 import { LlmCallBudget, RunWatchdog, ContextIsolationMode } from "../types";
-import { extractQwenJson, ReasoningEffort } from "./qwen-parser";
+import {
+  extractQwenJson,
+  extractThinkBlocks,
+  stripThinkTags,
+  ReasoningEffort,
+} from "./qwen-parser";
+
+/** Mutable sink the streaming helpers fill with a model's reasoning trace. */
+export interface ReasoningCapture {
+  trace: string;
+}
+
+/** Result of consuming a streaming prediction, split by fragment type. */
+export interface CollectedPrediction {
+  readonly text: string;
+  readonly reasoning: string;
+}
+
+/**
+ * Consumes a `model.respond` stream, splitting reasoning fragments from the
+ * answer. When the runtime tags reasoning (`reasoningType`), the answer text is
+ * naturally clean; when it does not, any inline ` thinking` block is recovered
+ * into `reasoning` and stripped from `text`.
+ *
+ * This is also what keeps a raw chain-of-thought out of the final report: only
+ * `text` is ever rendered downstream.
+ */
+export async function collectPredictionStream(
+  stream: AsyncIterable<{ content?: string; reasoningType?: string }>,
+): Promise<CollectedPrediction> {
+  let text = "";
+  let reasoning = "";
+  let sawReasoningFragments = false;
+  for await (const frag of stream) {
+    const content = frag?.content ?? "";
+    const type = frag?.reasoningType;
+    if (
+      type === "reasoning" ||
+      type === "reasoningStartTag" ||
+      type === "reasoningEndTag"
+    ) {
+      sawReasoningFragments = true;
+      // Start/end tag fragments are structural markers; skip their text.
+      if (type === "reasoning") reasoning += content;
+      continue;
+    }
+    text += content;
+  }
+  if (!sawReasoningFragments && text) {
+    const inline = extractThinkBlocks(text);
+    if (inline) {
+      reasoning = inline;
+      text = stripThinkTags(text);
+    }
+  }
+  return { text, reasoning };
+}
 
 /**
  * Bounded semaphore so parallel swarm workers never fire more concurrent
@@ -62,6 +118,8 @@ export interface AskModelOptions {
   readonly reasoningEffort?: ReasoningEffort;
   /** Hard switch that disables thinking tokens entirely. */
   readonly disableThinking?: boolean;
+  /** Optional sink that receives the model's reasoning trace, when enabled. */
+  readonly capture?: ReasoningCapture;
 }
 
 export interface AskStructuredOptions extends AskModelOptions {
@@ -175,6 +233,7 @@ export async function requestPrediction(
     signal?: AbortSignal;
     reasoningEffort?: ReasoningEffort;
     disableThinking?: boolean;
+    capture?: ReasoningCapture;
   },
 ): Promise<string | null> {
   if (opts.signal?.aborted) return null;
@@ -194,9 +253,9 @@ export async function requestPrediction(
       prepared as never,
       buildPredictionOptions({ maxTokens, temperature, ...opts }) as never,
     );
-    let result = "";
-    for await (const chunk of stream) result += chunk.content ?? "";
-    return result.trim() || null;
+    const collected = await collectPredictionStream(stream as never);
+    if (opts.capture) opts.capture.trace = collected.reasoning;
+    return collected.text.trim() || null;
   } catch {
     return null;
   }
@@ -237,6 +296,7 @@ export async function askStructured<S extends z.ZodTypeAny>(
     signal,
     reasoningEffort,
     disableThinking,
+    capture,
   } = options;
   const messages: ReadonlyArray<{ role: "system" | "user"; content: string }> =
     system
@@ -272,12 +332,12 @@ export async function askStructured<S extends z.ZodTypeAny>(
           disableThinking,
         }) as never,
       );
-      let result = "";
-      for await (const chunk of stream) result += chunk.content ?? "";
-      if (!result.trim()) return null;
+      const collected = await collectPredictionStream(stream as never);
+      if (capture) capture.trace = collected.reasoning;
+      if (!collected.text.trim()) return null;
       // extractQwenJson strips <think> blocks + Markdown fences and locates the
       // JSON boundaries; any failure falls through to the caller's fallback.
-      return schema.parse(extractQwenJson(result));
+      return schema.parse(extractQwenJson(collected.text));
     } catch {
       return null;
     }

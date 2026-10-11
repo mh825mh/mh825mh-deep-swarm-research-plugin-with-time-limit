@@ -1,8 +1,15 @@
-# 🐝 Deep Research w/ Swarm Agent (v5.8.2)
+# 🐝 Deep Research w/ Swarm Agent (v5.9.0)
 
 
 
 Autonomous deep research for LM Studio. A swarm of specialized AI workers searches your local documents and the web, dynamically adapting its strategy, verifying claims, and synthesizing everything into a structured, confidence-scored report with auditable citations—all in one tool call.
+
+## 🚀 What's New in v5.9.0?
+
+* **Epistemic uncertainty mining (DeepThink):** the planner now runs reasoning-enabled, and a new pure, deterministic miner (`src/swarm/uncertainty-miner.ts`) reads its ` thinking` trace for the questions the model *itself* flagged — "unclear whether…", "no data on…", "conflicts with…", "need to verify…", "insufficient evidence", "cannot determine", "unresolved". The unresolved questions are converted into targeted search queries, deduped against everything already executed, and enqueued as one bounded extra search wave (≤3 queries) before the critic — so the swarm investigates exactly the gaps its own reasoning exposed, with zero extra LLM calls.
+* **Cognitive scaffolding (`[THINKING PROTOCOL]`):** the planner and synthesis system prompts now carry a structured four-milestone reasoning rubric — **source credibility & recency audit → falsification & counter-claim checking → cross-domain corroboration verification → report structure outline** — turning free-form chain-of-thought into disciplined, verifiable deliberation whenever a phase runs with reasoning enabled.
+* **Reasoning audit sidecar:** chain-of-thought is now captured *separately* from the answer (LM Studio reasoning fragments are split by `reasoningType`, with an inline `…` fallback) so it can never leak into the report narrative. The raw traces are preserved in a new machine-readable `IResearchRunRecord` (returned on `ResearchResult.metadata`), and — when the new **Include Reasoning Audit** setting is on (default) — appended to the report as a collapsible **`Swarm Reasoning & Verification Trace`** section showing the planner reasoning, the mined uncertainty queries, and the synthesis reasoning.
+* **New setting:** *Include Reasoning Audit* (per-chat boolean, default **on**) toggles the collapsible reasoning/verification trace at the end of the report.
 
 ## 🚀 What's New in v5.8.2?
 
@@ -405,6 +412,7 @@ For organizations with large datalakes, the plugin searches in priority order:
 
 ## 📜 Changelog
 
+* **v5.9.0** - DeepThink reasoning architecture: epistemic uncertainty mining (`src/swarm/uncertainty-miner.ts` parses the planner's ` thinking` trace for self-flagged gaps — unclear/no-data/conflicts/needs-verification — and enqueues bounded targeted queries as an extra search wave); cognitive scaffolding (`[THINKING_PROTOCOL]` four-milestone rubric in the planner + synthesis system prompts); reasoning audit sidecar (chain-of-thought split from the answer via LM Studio reasoning fragments/inline fallback, stored on a new `IResearchRunRecord` and appended as a collapsible "Swarm Reasoning & Verification Trace" section behind the new `includeReasoningAudit` setting, default on).
 * **v5.8.2** - Qwen 3 reasoning hardening: `<think>`-aware `extractQwenJson` parser routed through all LLM JSON paths; per-phase reasoning control (`reasoningEffort` / `disableThinking`, `/no_think` + `enable_thinking:false`) for planner/critic/synthesis/gatekeeper/query-mutation with isolated message arrays; deterministic heuristic evidence pre-filter (min length, boilerplate/paywall, <20% query overlap) before any critic LLM call; 6,000-char evidence-chunk cap with HTML stripping; RAG gatekeeper extracted to `src/local/gatekeeper.ts`.
 * **v5.8.1** - Compact settings UI; Safe Search hidden, default off.
 * **v5.8.0** - Structured plans & verdicts: the AI planner now outputs a validated JSON plan (workers, open questions, stop conditions, estimated time, `index-only` citation policy, domain tags) via LM Studio structured output with a deterministic fallback, and the critic parses JSON verdict batches the same way. Shared blackboard makes the plan, open gaps, merged evidence cards, graded ledger, blocked URLs, and the live time budget visible to all workers. pass^k-lite: an independent citation verifier checks every `[n]` and URL against the ledger, one synthesis retry is allowed on failure, and the footer records citation pass / contradictions / retry / skill pack. Deterministic guardrails: domain allow/deny lists, per-PDF byte cap, per-run external-tool call budget, a `confirmed:true` human-approval gate before any RAG write or external tool call, and prompt-injection scrubbing of extracted page text. Skill packs ship as AGENTS.md-style packs (academic / policy / market) auto-selected from the planner's domain tags, with per-user overrides under `~/.deep-swarm-research/skills/`.

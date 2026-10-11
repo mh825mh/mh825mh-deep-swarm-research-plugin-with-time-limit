@@ -1,5 +1,5 @@
 import { logLlmDiagnostics } from "../utils/tokens";
-import { askLoadedModel, askStructured } from "../utils/llm";
+import { askLoadedModel, askStructured, ReasoningCapture } from "../utils/llm";
 import { extractQwenJson } from "../utils/qwen-parser";
 import {
   QueryPlan,
@@ -33,21 +33,27 @@ import {
   QUERY_LINE_MIN_LEN,
   QUERY_LINE_MAX_LEN,
   SYSTEM_INSTRUCTIONS,
+  THINKING_PROTOCOL,
 } from "../constants";
+
+/** Planner system prompt: base engine instructions plus the thinking rubric. */
+const PLANNER_SYSTEM = `${SYSTEM_INSTRUCTIONS}\n\n${THINKING_PROTOCOL}`;
 
 async function callLoadedModel(
   prompt: string,
   maxTokens: number = AI_PLANNING_MAX_TOKENS,
   temperature: number = AI_PLANNING_TEMPERATURE,
   timeoutMs: number = AI_PLANNING_TIMEOUT_MS,
+  opts: { system?: string; capture?: ReasoningCapture } = {},
 ): Promise<string | null> {
   return askLoadedModel(prompt, {
-    system: SYSTEM_INSTRUCTIONS,
+    system: opts.system ?? SYSTEM_INSTRUCTIONS,
     maxTokens,
     temperature,
     timeoutMs,
     // Planning benefits from the model's reasoning; keep thinking on.
     reasoningEffort: "high",
+    capture: opts.capture,
   });
 }
 
@@ -131,25 +137,28 @@ async function aiDecompose(
   focusAreas: ReadonlyArray<string>,
   status: StatusFn,
   profile: DepthProfile,
-): Promise<ResearchPlan | null> {
+): Promise<{ plan: ResearchPlan | null; reasoning: string }> {
   const prompt = makeDecompositionPrompt(topic, focusAreas, profile);
+  const capture: ReasoningCapture = { trace: "" };
 
   // Preferred path: native structured output (JSON schema) with zod validation.
   const structured = await askStructured(prompt, researchPlanSchema, {
-    system: SYSTEM_INSTRUCTIONS,
+    system: PLANNER_SYSTEM,
     jsonSchema: researchPlanJsonSchema,
     maxTokens: AI_DECOMPOSITION_MAX_TOKENS,
     temperature: AI_DECOMPOSITION_TEMPERATURE,
     timeoutMs: AI_DECOMPOSITION_TIMEOUT_MS,
     reasoningEffort: "high",
+    capture,
   });
+  const structuredReasoning = capture.trace;
   if (structured) {
     const plan = researchPlanFromParsed(structured);
     if (plan.workers.length >= DECOMPOSITION_MIN_WORKERS) {
       status(
         `AI decomposed topic into ${plan.workers.length} structured workers (tags: ${plan.domainTags.join(", ") || "none"})`,
       );
-      return plan;
+      return { plan, reasoning: structuredReasoning };
     }
   }
 
@@ -159,13 +168,15 @@ async function aiDecompose(
     AI_DECOMPOSITION_MAX_TOKENS,
     AI_DECOMPOSITION_TEMPERATURE,
     AI_DECOMPOSITION_TIMEOUT_MS,
+    { system: PLANNER_SYSTEM, capture },
   );
-  if (!raw) return null;
+  const reasoning = capture.trace || structuredReasoning;
+  if (!raw) return { plan: null, reasoning };
   try {
     const parsed = extractQwenJson<any>(raw);
     const list = Array.isArray(parsed) ? parsed : parsed.workers;
     if (!Array.isArray(list) || list.length < DECOMPOSITION_MIN_WORKERS)
-      return null;
+      return { plan: null, reasoning };
     const specs: DynamicWorkerSpec[] = [];
     for (const item of list.slice(0, profile.maxDecompositionWorkers)) {
       const role = VALID_ROLES.includes(item.role) ? item.role : "breadth";
@@ -192,7 +203,7 @@ async function aiDecompose(
           : undefined,
       });
     }
-    if (specs.length < DECOMPOSITION_MIN_WORKERS) return null;
+    if (specs.length < DECOMPOSITION_MIN_WORKERS) return { plan: null, reasoning };
     const totalWeight = specs.reduce((sum, s) => sum + s.budgetWeight, 0);
     const normalised = specs.map((s) => ({
       ...s,
@@ -219,9 +230,9 @@ async function aiDecompose(
       domainTags,
     };
     status(`AI decomposed topic into ${normalised.length} specialised workers`);
-    return plan;
+    return { plan, reasoning };
   } catch {
-    return null;
+    return { plan: null, reasoning };
   }
 }
 
@@ -333,9 +344,12 @@ export async function buildQueryPlan(
   let dynamicSpecs: ReadonlyArray<DynamicWorkerSpec> | undefined;
   let researchPlan: ResearchPlan | undefined;
   let domainTags: ReadonlyArray<string> | undefined;
+  let plannerReasoning = "";
   if (useAI) {
     status("AI task decomposition - analysing topic for specialised workers...");
-    const plan = await aiDecompose(topic, focusAreas, status, profile);
+    const decomposition = await aiDecompose(topic, focusAreas, status, profile);
+    const plan = decomposition.plan;
+    plannerReasoning = decomposition.reasoning;
     if (plan && plan.workers.length >= DECOMPOSITION_MIN_WORKERS) {
       dynamicSpecs = plan.workers;
       researchPlan = plan;
@@ -407,6 +421,7 @@ export async function buildQueryPlan(
     dynamicSpecs,
     researchPlan,
     domainTags,
+    plannerReasoning: plannerReasoning || undefined,
   };
 } 
 

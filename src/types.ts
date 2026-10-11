@@ -186,6 +186,11 @@ export interface CompiledReport {
   readonly contradictionCount?: number;
   /** Skill pack auto-selected from planner domain tags, e.g. "academic v1". */
   readonly skillUsed?: string;
+  /**
+   * Raw ` thinking` trace captured from the synthesis completion. Kept out of the
+   * rendered narrative and surfaced only in the audit sidecar.
+   */
+  readonly reasoningTrace?: string;
 }
 
 /**
@@ -378,6 +383,11 @@ export interface QueryPlan {
   readonly researchPlan?: ResearchPlan;
   /** Domain classification tags used for skill-pack auto-selection (item 8). */
   readonly domainTags?: ReadonlyArray<string>;
+  /**
+   * Raw ` thinking` trace captured from the planner's reasoning-enabled call.
+   * Mined for unresolved questions that seed an extra search round.
+   */
+  readonly plannerReasoning?: string;
 }
 
 /**
@@ -533,6 +543,11 @@ export interface ResearchConfig {
   readonly requireApprovalForWrites?: boolean;
   /** Max simultaneous in-flight LLM predictions (0 = default of 1). */
   readonly llmConcurrency?: number;
+  /**
+   * When true (default), append a collapsible "Swarm Reasoning & Verification
+   * Trace" section to the final report.
+   */
+  readonly includeReasoningAudit?: boolean;
 }
 
 export interface ResearchResult {
@@ -540,6 +555,30 @@ export interface ResearchResult {
   readonly queriesUsed: ReadonlyArray<string>;
   readonly totalSources: number;
   readonly totalRounds: number;
+  /** Machine-readable audit record (reasoning traces) for the run. */
+  readonly metadata?: IResearchRunRecord;
+}
+
+/**
+ * Reasoning traces preserved from a run's reasoning-enabled LLM calls. These are
+ * the auditable "why" behind the plan and the synthesis, kept out of the report
+ * narrative itself.
+ */
+export interface ReasoningTrace {
+  /** Reasoning surfaced by the planner before crawling. */
+  readonly planner?: string;
+  /** Reasoning surfaced by the synthesis stage. */
+  readonly synthesis?: string;
+  /** Unresolved questions mined from the planner trace and searched in Round 2. */
+  readonly minedQueries?: ReadonlyArray<string>;
+}
+
+/** Audit ledger metadata object attached to a completed research run. */
+export interface IResearchRunRecord {
+  readonly runId: string;
+  readonly topic: string;
+  readonly timestamp: string;
+  readonly reasoningTrace?: ReasoningTrace;
 }
 
 export interface ContextBudget {
