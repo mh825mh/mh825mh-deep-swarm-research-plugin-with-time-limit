@@ -2,6 +2,7 @@
 import { LMStudioClient } from "@lmstudio/sdk";
 import { z } from "zod";
 import { LlmCallBudget, RunWatchdog, ContextIsolationMode } from "../types";
+import { extractQwenJson, ReasoningEffort } from "./qwen-parser";
 
 /**
  * Bounded semaphore so parallel swarm workers never fire more concurrent
@@ -57,11 +58,112 @@ export interface AskModelOptions {
   readonly temperature?: number;
   readonly timeoutMs?: number;
   readonly signal?: AbortSignal;
+  /** Granular thinking control for Qwen-style models. `none` disables reasoning. */
+  readonly reasoningEffort?: ReasoningEffort;
+  /** Hard switch that disables thinking tokens entirely. */
+  readonly disableThinking?: boolean;
 }
 
 export interface AskStructuredOptions extends AskModelOptions {
   /** Plain JSON Schema (draft-07 subset) handed to LM Studio structured output. */
   readonly jsonSchema: Record<string, unknown>;
+}
+
+/** Extra prediction-payload fields that carry thinking-control directives. */
+type ReasoningPayload = Record<string, unknown>;
+
+/**
+ * True when thinking must be turned off: either an explicit `disableThinking`
+ * flag or `reasoningEffort: 'none'` (used for repetitive / extraction tasks).
+ */
+function thinkingDisabled(opts: {
+  reasoningEffort?: ReasoningEffort;
+  disableThinking?: boolean;
+}): boolean {
+  return opts.disableThinking === true || opts.reasoningEffort === "none";
+}
+
+/**
+ * Builds the extra prediction-config fields for thinking control.
+ *
+ * The LM Studio JS SDK only exposes the experimental `enableThinking` boolean,
+ * so we set that (guaranteed to work) and additionally pass the raw
+ * `chat_template_kwargs: { enable_thinking: false }` + `reasoning` fields via an
+ * untyped payload for runtimes that accept them.
+ */
+function buildReasoningConfig(opts: {
+  reasoningEffort?: ReasoningEffort;
+  disableThinking?: boolean;
+}): ReasoningPayload {
+  if (thinkingDisabled(opts)) {
+    return {
+      enableThinking: false,
+      chat_template_kwargs: { enable_thinking: false },
+      reasoning: "off",
+    };
+  }
+  if (opts.reasoningEffort) {
+    return {
+      enableThinking: true,
+      chat_template_kwargs: { enable_thinking: true },
+      reasoning: opts.reasoningEffort,
+    };
+  }
+  return {};
+}
+
+/**
+ * Appends the Qwen `/no_think` soft-switch to the last user message as a
+ * fallback directive for templates that ignore the API-level flag.
+ */
+function applyNoThink<T extends { role: string; content: string }>(
+  messages: ReadonlyArray<T>,
+  disabled: boolean,
+): ReadonlyArray<T> {
+  if (!disabled) return messages;
+  const copy = [...messages];
+  for (let i = copy.length - 1; i >= 0; i--) {
+    if (copy[i].role === "user") {
+      copy[i] = { ...copy[i], content: `${copy[i].content}\n/no_think` };
+      break;
+    }
+  }
+  return copy;
+}
+
+export interface PredictionConfigOptions {
+  readonly maxTokens?: number;
+  readonly temperature?: number;
+  readonly structured?: unknown;
+  readonly reasoningEffort?: ReasoningEffort;
+  readonly disableThinking?: boolean;
+}
+
+/**
+ * Assembles a full `model.respond` prediction config, including the thinking
+ * directives. Shared by the central helpers and the direct `model.respond`
+ * call sites (synthesis, gatekeeper) so reasoning controls stay consistent.
+ */
+export function buildPredictionOptions(
+  opts: PredictionConfigOptions,
+): Record<string, unknown> {
+  const cfg: Record<string, unknown> = {};
+  if (opts.maxTokens !== undefined) cfg.maxTokens = opts.maxTokens;
+  if (opts.temperature !== undefined) cfg.temperature = opts.temperature;
+  if (opts.structured !== undefined) cfg.structured = opts.structured;
+  Object.assign(cfg, buildReasoningConfig(opts));
+  return cfg;
+}
+
+/**
+ * Applies the `/no_think` directive to a message array when thinking is off.
+ * Exposed so direct call sites build an isolated, directive-tagged prompt.
+ */
+export function withThinkingDirective<T extends { role: string; content: string }>(
+  messages: ReadonlyArray<T>,
+  opts: { reasoningEffort?: ReasoningEffort; disableThinking?: boolean },
+): ReadonlyArray<T> {
+  return applyNoThink(messages, thinkingDisabled(opts));
 }
 
 export async function requestPrediction(
@@ -71,6 +173,8 @@ export async function requestPrediction(
     temperature?: number;
     timeoutMs?: number;
     signal?: AbortSignal;
+    reasoningEffort?: ReasoningEffort;
+    disableThinking?: boolean;
   },
 ): Promise<string | null> {
   if (opts.signal?.aborted) return null;
@@ -85,7 +189,11 @@ export async function requestPrediction(
     ]);
     if (!Array.isArray(models) || models.length === 0) return null;
     const model = await client.llm.model(models[0].identifier);
-    const stream = model.respond(messages as never, { maxTokens, temperature });
+    const prepared = applyNoThink(messages, thinkingDisabled(opts));
+    const stream = model.respond(
+      prepared as never,
+      buildPredictionOptions({ maxTokens, temperature, ...opts }) as never,
+    );
     let result = "";
     for await (const chunk of stream) result += chunk.content ?? "";
     return result.trim() || null;
@@ -127,6 +235,8 @@ export async function askStructured<S extends z.ZodTypeAny>(
     temperature = 0.3,
     timeoutMs = 30_000,
     signal,
+    reasoningEffort,
+    disableThinking,
   } = options;
   const messages: ReadonlyArray<{ role: "system" | "user"; content: string }> =
     system
@@ -148,19 +258,26 @@ export async function askStructured<S extends z.ZodTypeAny>(
       ]);
       if (!Array.isArray(models) || models.length === 0) return null;
       const model = await client.llm.model(models[0].identifier);
-      const stream = model.respond(messages as never, {
-        maxTokens,
-        temperature,
-        structured: { type: "json", jsonSchema },
-      });
+      const prepared = applyNoThink(
+        messages,
+        thinkingDisabled({ reasoningEffort, disableThinking }),
+      );
+      const stream = model.respond(
+        prepared as never,
+        buildPredictionOptions({
+          maxTokens,
+          temperature,
+          structured: { type: "json", jsonSchema },
+          reasoningEffort,
+          disableThinking,
+        }) as never,
+      );
       let result = "";
       for await (const chunk of stream) result += chunk.content ?? "";
-      const cleaned = result
-        .replace(/^```(?:json)?\s*/i, "")
-        .replace(/```\s*$/i, "")
-        .trim();
-      if (!cleaned) return null;
-      return schema.parse(JSON.parse(cleaned));
+      if (!result.trim()) return null;
+      // extractQwenJson strips <think> blocks + Markdown fences and locates the
+      // JSON boundaries; any failure falls through to the caller's fallback.
+      return schema.parse(extractQwenJson(result));
     } catch {
       return null;
     }

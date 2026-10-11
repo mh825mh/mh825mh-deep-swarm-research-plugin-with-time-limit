@@ -1,5 +1,6 @@
 import { logLlmDiagnostics } from "../utils/tokens";
 import { askLoadedModel, askStructured } from "../utils/llm";
+import { extractQwenJson } from "../utils/qwen-parser";
 import {
   QueryPlan,
   WorkerRole,
@@ -45,6 +46,8 @@ async function callLoadedModel(
     maxTokens,
     temperature,
     timeoutMs,
+    // Planning benefits from the model's reasoning; keep thinking on.
+    reasoningEffort: "high",
   });
 }
 
@@ -138,6 +141,7 @@ async function aiDecompose(
     maxTokens: AI_DECOMPOSITION_MAX_TOKENS,
     temperature: AI_DECOMPOSITION_TEMPERATURE,
     timeoutMs: AI_DECOMPOSITION_TIMEOUT_MS,
+    reasoningEffort: "high",
   });
   if (structured) {
     const plan = researchPlanFromParsed(structured);
@@ -158,8 +162,7 @@ async function aiDecompose(
   );
   if (!raw) return null;
   try {
-    const jsonStr = raw.replace(/```json\s*|```\s*/g, "").trim();
-    const parsed = JSON.parse(jsonStr);
+    const parsed = extractQwenJson<any>(raw);
     const list = Array.isArray(parsed) ? parsed : parsed.workers;
     if (!Array.isArray(list) || list.length < DECOMPOSITION_MIN_WORKERS)
       return null;

@@ -1,6 +1,6 @@
 import { runWorker, CrawlMetrics } from "./worker";
 import { SwarmBlackboard } from "./blackboard";
-import { LMStudioClient } from "@lmstudio/sdk";
+import { topicNeedsLocalSources } from "../local/gatekeeper";
 import {
   buildQueryPlan,
   buildAdaptiveGapFill,
@@ -628,25 +628,17 @@ void memoryContext;
   // LAYER 1: THE AI RAG GATEKEEPER
   // ==========================================
   let shouldSearchLocal = cfg.enableLocalSources;
-  
+
   if (shouldSearchLocal && plan.usedAI) {
     fileStatus(`\n🤖 PRE-FLIGHT: Validating if topic requires local RAG...`);
-    try {
-      const client = new LMStudioClient();
-      const models = await client.llm.listLoaded();
-      if (models && models.length > 0) {
-        const model = await client.llm.model(models[0].identifier);
-        const gatePrompt = `Topic: "${cfg.topic}". Does this query explicitly ask for personal, internal, or company documents? Answer ONLY YES or NO.`;
-        const stream = model.respond([{ role: "user", content: gatePrompt }], { maxTokens: 10, temperature: 0.1 });
-        let result = "";
-        for await (const chunk of stream) result += chunk.content ?? "";
-        
-        if (result.trim().toUpperCase().includes("NO")) {
-          fileWarn(`[RAG GATE] Topic does not require local files. Bypassing Layer 1 to save context budget.`);
-          shouldSearchLocal = false;
-        }
-      }
-    } catch (e) {
+    const gate = await topicNeedsLocalSources({
+      topic: cfg.topic,
+      signal,
+    });
+    if (gate === "no") {
+      fileWarn(`[RAG GATE] Topic does not require local files. Bypassing Layer 1 to save context budget.`);
+      shouldSearchLocal = false;
+    } else if (gate === "error") {
       fileWarn(`[RAG GATE] LLM check failed, defaulting to web-only.`);
       shouldSearchLocal = false;
     }

@@ -13,6 +13,7 @@ import {
   VerificationTier,
 } from "../types";
 import { DepthProfile } from "../constants";
+import { boundEvidenceChunk } from "../utils/text";
 
 export function buildEvidenceCards(
   sources: ReadonlyArray<CrawledSource>,
@@ -62,8 +63,10 @@ export function buildEvidenceCards(
       authorOrHost: domain,
       canonicalUrl: s.url,
       sourceTier: s.tier,
-      relevantClaim: s.description || s.text.slice(0, claimChars),
-      supportingExcerpt: s.text.slice(0, excerptChars).replace(/\n+/g, " ").trim(),
+      relevantClaim: boundEvidenceChunk(
+        s.description || s.text.slice(0, claimChars),
+      ),
+      supportingExcerpt: boundEvidenceChunk(s.text.slice(0, excerptChars)),
       confidence:
         s.relevanceScore > 0.6
           ? "High"

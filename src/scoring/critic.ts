@@ -26,6 +26,9 @@ import {
   SkillPack,
 } from "../types";
 import { LlmCallManager, askLoadedModel, askStructured, hasLoadedModel } from "../utils/llm";
+import { extractQwenJson } from "../utils/qwen-parser";
+import { boundEvidenceChunk } from "../utils/text";
+import { passesHeuristicFilter } from "./heuristics";
 import {
   CRITIC_CARDS_PER_BATCH,
   CRITIC_MAX_GRADE_BATCHES,
@@ -143,12 +146,8 @@ function preGrade(
 export function parseVerdicts(
   raw: string,
 ): ReadonlyMap<string, Partial<CriticVerdict>> {
-  const cleaned = raw
-    .replace(/^```(?:json)?\s*/i, "")
-    .replace(/```\s*$/i, "")
-    .trim();
   try {
-    const parsed = JSON.parse(cleaned);
+    const parsed = extractQwenJson<any>(raw);
     const list = Array.isArray(parsed) ? { verdicts: parsed } : parsed;
     const validated = criticVerdictBatchSchema.safeParse(list);
     if (validated.success && validated.data.verdicts.length > 0) {
@@ -297,14 +296,17 @@ function buildBatchPrompt(
       : "(none yet)";
 
   const cardsBlock = batch
-    .map(
-      (c) =>
+    .map((c) => {
+      const claim = boundEvidenceChunk(c.relevantClaim).slice(0, 220);
+      const excerpt = boundEvidenceChunk(c.supportingExcerpt).slice(0, 400);
+      return (
         `[${c.id}] "${c.title}"\n` +
         `Author/host: ${c.authorOrHost} | Tier: ${c.sourceTier} | ` +
         `Published: ${c.freshness ?? "unknown"} | Confidence: ${c.confidence}\n` +
-        `Claim: ${c.relevantClaim.slice(0, 220)}\n` +
-        `Excerpt: ${c.supportingExcerpt.slice(0, 400)}`,
-    )
+        `Claim: ${claim}\n` +
+        `Excerpt: ${excerpt}`
+      );
+    })
     .join("\n\n");
 
   return `You are a VERIFIER critic, NOT a researcher. You cannot search and must not propose queries. You grade ONLY the evidence cards below against the research topic.
@@ -356,6 +358,10 @@ async function gradeBatch(
     temperature: CRITIC_TEMPERATURE,
     timeoutMs: CRITIC_TIMEOUT_MS,
     signal,
+    // The critic is pure extraction/classification — reasoning tokens add no
+    // value and would slow every batch down.
+    reasoningEffort: "none" as const,
+    disableThinking: true,
   };
 
   // Preferred path: native structured output with a JSON schema; the verdicts
@@ -391,7 +397,39 @@ export async function runCritic(options: RunCriticOptions): Promise<RunCriticRes
   const graded: GradedEvidenceCard[] = [];
   const failed: GradedEvidenceCard[] = [];
   const ledgerWindow: EvidenceCard[] = [...(priorAccepted ?? [])];
-  const remaining = [...cards];
+
+  // Deterministic fast-path: reject unusable cards before any LLM batch so the
+  // critic only spends inference on evidence worth grading.
+  const remaining: EvidenceCard[] = [];
+  let heuristicRejected = 0;
+  for (const card of cards) {
+    const heuristic = passesHeuristicFilter({
+      url: card.canonicalUrl,
+      title: card.title,
+      text: `${card.relevantClaim} ${card.supportingExcerpt}`,
+      query: topic,
+    });
+    if (heuristic.pass) {
+      remaining.push(card);
+      continue;
+    }
+    heuristicRejected++;
+    const base = finalizeVerdict(card, topicKeywords, undefined);
+    failed.push({
+      ...card,
+      critic: {
+        ...base,
+        onTopic: false,
+        pass: false,
+        note: `heuristic reject: ${heuristic.reason ?? "failed pre-filter"}`,
+      },
+    });
+  }
+  if (heuristicRejected > 0) {
+    status?.(
+      `[CRITIC] Heuristic pre-filter rejected ${heuristicRejected} card(s) before any LLM call.`,
+    );
+  }
 
   let batches = 0;
   while (remaining.length > 0 && batches < CRITIC_MAX_GRADE_BATCHES) {

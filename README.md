@@ -1,8 +1,16 @@
-# 🐝 Deep Research w/ Swarm Agent (v5.8.1)
+# 🐝 Deep Research w/ Swarm Agent (v5.8.2)
 
 
 
 Autonomous deep research for LM Studio. A swarm of specialized AI workers searches your local documents and the web, dynamically adapting its strategy, verifying claims, and synthesizing everything into a structured, confidence-scored report with auditable citations—all in one tool call.
+
+## 🚀 What's New in v5.8.2?
+
+* **Qwen 3 reasoning hardening:** every LLM-completion JSON path now flows through a single `extractQwenJson` parser that strips `<think>…</think>` blocks (case-insensitive and nested-safe), removes Markdown code fences, and slices the outermost `{…}`/`[…]` payload before parsing — a chain-of-thought prefix can no longer break the planner, critic, or structured-output schemas.
+* **Per-phase reasoning control:** new `reasoningEffort` / `disableThinking` options on the LLM layer tune thinking per phase. Repetitive tasks (critic, RAG gatekeeper, query mutation) run with thinking off (`enable_thinking:false` + a `/no_think` directive), the planner runs at `high`, synthesis at `medium`, and contradiction detection at `none`. Each call uses an isolated message array, so `<think>` context never leaks across worker turns.
+* **Deterministic evidence pre-filter:** a new pure heuristic rejects unusable cards — text shorter than 180 chars, boilerplate/paywall signatures (“access denied”, “please enable javascript”, “sign in to continue”), and query-keyword overlap below 20% — *before* any LLM critic call, saving inference and keeping rejections deterministic and auditable.
+* **Bounded evidence chunks:** evidence excerpts and claims are stripped of HTML artifacts and hard-capped at 6,000 characters everywhere they enter the LLM (critic batches, synthesis ledger), preventing KV-cache bloat from oversized pages.
+* **RAG gatekeeper extracted & offline-safe:** the inline pre-flight gate now lives in `src/local/gatekeeper.ts`, runs with reasoning disabled, and preserves the original yes/no/error logging.
 
 ## 🚀 What's New in v5.8.0?
 
@@ -397,6 +405,7 @@ For organizations with large datalakes, the plugin searches in priority order:
 
 ## 📜 Changelog
 
+* **v5.8.2** - Qwen 3 reasoning hardening: `<think>`-aware `extractQwenJson` parser routed through all LLM JSON paths; per-phase reasoning control (`reasoningEffort` / `disableThinking`, `/no_think` + `enable_thinking:false`) for planner/critic/synthesis/gatekeeper/query-mutation with isolated message arrays; deterministic heuristic evidence pre-filter (min length, boilerplate/paywall, <20% query overlap) before any critic LLM call; 6,000-char evidence-chunk cap with HTML stripping; RAG gatekeeper extracted to `src/local/gatekeeper.ts`.
 * **v5.8.1** - Compact settings UI; Safe Search hidden, default off.
 * **v5.8.0** - Structured plans & verdicts: the AI planner now outputs a validated JSON plan (workers, open questions, stop conditions, estimated time, `index-only` citation policy, domain tags) via LM Studio structured output with a deterministic fallback, and the critic parses JSON verdict batches the same way. Shared blackboard makes the plan, open gaps, merged evidence cards, graded ledger, blocked URLs, and the live time budget visible to all workers. pass^k-lite: an independent citation verifier checks every `[n]` and URL against the ledger, one synthesis retry is allowed on failure, and the footer records citation pass / contradictions / retry / skill pack. Deterministic guardrails: domain allow/deny lists, per-PDF byte cap, per-run external-tool call budget, a `confirmed:true` human-approval gate before any RAG write or external tool call, and prompt-injection scrubbing of extracted page text. Skill packs ship as AGENTS.md-style packs (academic / policy / market) auto-selected from the planner's domain tags, with per-user overrides under `~/.deep-swarm-research/skills/`.
 * **v5.7.0** - Critic/verifier agent (evaluator-optimizer loop): dedicated non-searching critic grades every evidence card (on-topic, dated, primary/secondary, claim strength, contradicts ledger) via deterministic pre-score + budgeted LLM pass with heuristic fallback; only failing claims trigger one targeted ≤3-query retry round, incrementally re-graded against the accepted ledger; synthesis reads a critic-verified ledger (PASS cards only) and surfaces critic-flagged disagreements as severity-ranked contradiction entries.

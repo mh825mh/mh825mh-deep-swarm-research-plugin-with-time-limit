@@ -2,6 +2,8 @@
 import { LMStudioClient } from "@lmstudio/sdk";
 import { ReportSource, ContradictionEntry, StatusFn, EvidenceCard, GradedEvidenceCard, ContextBudget, SkillPack } from "../types";
 import { logLlmDiagnostics, estimateTokens, preflightSynthesis } from "../utils/tokens";
+import { buildPredictionOptions, withThinkingDirective } from "../utils/llm";
+import { boundEvidenceChunk } from "../utils/text";
 import {
   DepthProfile,
   AI_SYNTHESIS_TEMPERATURE,
@@ -37,7 +39,9 @@ function prepareEvidenceLedger(
 
   for (const card of sorted) {
     if (!card.critic.pass) continue;
-    const entry = `[${card.id}] (${card.entityType}) ${card.title} - ${card.authorOrHost}\nURL: ${card.canonicalUrl}\nTier: ${card.sourceTier} | Confidence: ${card.confidence} | Freshness: ${card.freshness ?? "Unknown"}\nCRITIC: ${renderVerdict(card)}\nClaim: ${card.relevantClaim}\nExcerpt: "${card.supportingExcerpt}"`;
+    const claim = boundEvidenceChunk(card.relevantClaim);
+    const excerpt = boundEvidenceChunk(card.supportingExcerpt);
+    const entry = `[${card.id}] (${card.entityType}) ${card.title} - ${card.authorOrHost}\nURL: ${card.canonicalUrl}\nTier: ${card.sourceTier} | Confidence: ${card.confidence} | Freshness: ${card.freshness ?? "Unknown"}\nCRITIC: ${renderVerdict(card)}\nClaim: ${claim}\nExcerpt: "${excerpt}"`;
 
     const entryTokens = estimateTokens(entry);
     if (currentTokens + entryTokens > tokenLimit) break;
@@ -109,15 +113,20 @@ SYNTHESIS:`;
     if (!Array.isArray(models) || models.length === 0) return null;
     const model = await client.llm.model(models[0].identifier);
 
-    const stream = model.respond(
+    const messages = withThinkingDirective(
       [
-        { role: "system", content: SYSTEM_INSTRUCTIONS },
-        { role: "user", content: prompt },
+        { role: "system" as const, content: SYSTEM_INSTRUCTIONS },
+        { role: "user" as const, content: prompt },
       ],
-      {
+      { reasoningEffort: "medium" },
+    );
+    const stream = model.respond(
+      messages as never,
+      buildPredictionOptions({
         maxTokens: budget.outputReserve,
         temperature: AI_SYNTHESIS_TEMPERATURE,
-      }
+        reasoningEffort: "medium",
+      }) as never,
     );
 
     let result = "";
@@ -225,9 +234,18 @@ OUTPUT:`;
     if (!models || models.length === 0) return [];
     const model = await client.llm.model(models[0].identifier);
     
+    const messages = withThinkingDirective(
+      [{ role: "user" as const, content: prompt }],
+      { reasoningEffort: "none", disableThinking: true },
+    );
     const stream = model.respond(
-      [{ role: "user", content: prompt }],
-      { maxTokens: 1500, temperature: 0.15 }
+      messages as never,
+      buildPredictionOptions({
+        maxTokens: 1500,
+        temperature: 0.15,
+        reasoningEffort: "none",
+        disableThinking: true,
+      }) as never,
     );
 
     let raw = "";

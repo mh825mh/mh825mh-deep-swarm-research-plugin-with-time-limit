@@ -199,6 +199,19 @@ export const SEARCH_RESULTS_DEFAULT = 10;
 /** Hard safety cap on results fetched *per engine* from the extra/fallback engines. */
 export const EXTRA_ENGINE_MAX_RESULTS = 24;
 
+// ---------------------------------------------------------------------------
+// Qwen reasoning hardening: evidence-chunk bounding + heuristic pre-filter
+// ---------------------------------------------------------------------------
+/** Hard cap on a single evidence chunk fed to the LLM (~1,500 tokens). */
+export const EVIDENCE_CHUNK_MAX_CHARS = 6_000;
+/** Minimum excerpt length before an evidence card is worth grading. */
+export const HEURISTIC_MIN_TEXT_LEN = 180;
+/** Minimum query-keyword overlap ratio a snippet must reach to be graded. */
+export const HEURISTIC_MIN_KEYWORD_OVERLAP = 0.2;
+/** Boilerplate / paywall signatures that make a snippet worthless to grade. */
+export const BOILERPLATE_SIGNATURE_RE =
+  /access denied|403 forbidden|please enable javascript|sign in to continue/i;
+
 export const SYSTEM_INSTRUCTIONS = `You are a core component of the Deep Swarm Research engine.
 Your goal is to provide precise, high-quality research planning, task decomposition, and findings synthesis.
 Be analytical and objective. Avoid conversational filler. Follow the requested output format strictly.

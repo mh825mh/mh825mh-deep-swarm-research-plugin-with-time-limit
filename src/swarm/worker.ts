@@ -794,6 +794,9 @@ async function getLLMQueryMutation(
     temperature: 0.7,
     timeoutMs: 15_000,
     signal,
+    // Repetitive one-line generation — reasoning tokens are pure overhead.
+    reasoningEffort: "none",
+    disableThinking: true,
   });
   return mutated ? mutated.replace(/^["']|["']$/g, "") : null;
 }
