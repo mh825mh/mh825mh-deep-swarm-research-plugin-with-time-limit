@@ -1,7 +1,7 @@
 import { runWorker, CrawlMetrics } from "./worker";
 import { SwarmBlackboard } from "./blackboard";
 import { topicNeedsLocalSources } from "../local/gatekeeper";
-import { extractUncertaintyQueries } from "./uncertainty-miner";
+import { extractUncertaintyQueries, filterNovelQueries, shouldMineUncertainty } from "./uncertainty-miner";
 import {
   buildQueryPlan,
   buildAdaptiveGapFill,
@@ -817,13 +817,36 @@ void memoryContext;
     !llmManager.signal.aborted &&
     Date.now() < crawlDeadline
   ) {
-    const alreadySearched = new Set(allQueries.map((q) => q.toLowerCase()));
-    minedUncertaintyQueries = extractUncertaintyQueries(
-      plannerReasoning,
-      cfg.topic,
-    )
-      .filter((q) => !alreadySearched.has(q.toLowerCase()))
-      .slice(0, UNCERTAINTY_MAX_QUERIES);
+    // Budget guard: never let the optional mining wave starve synthesis. Skip
+    // once 65% of the hard runtime has elapsed (15% buffer before the 80%
+    // crawl cutoff) or when too few LLM calls remain for the live workers.
+    const elapsedFraction =
+      effectiveRuntimeMs === Infinity
+        ? 0
+        : (Date.now() - startTime) / effectiveRuntimeMs;
+    const remainingCalls =
+      llmManager.budget.maxGlobalCalls - llmManager.watchdog.llmCallsMade;
+    const activeWorkers = Math.max(1, roles.length);
+    const skipReason = shouldMineUncertainty({
+      elapsedFraction,
+      remainingLlmCalls: remainingCalls,
+      activeWorkers,
+    });
+
+    if (skipReason) {
+      fileStatus(
+        `[UNCERTAINTY] Skipping mined queries (${skipReason}; ` +
+          `${Math.round(elapsedFraction * 100)}% elapsed, ` +
+          `${remainingCalls} LLM call(s) left) — preserving synthesis budget.`,
+      );
+    } else {
+      // Dedupe mined questions against every query already executed this run
+      // (the orchestrator's query log) using normalized-token Jaccard overlap.
+      minedUncertaintyQueries = filterNovelQueries(
+        extractUncertaintyQueries(plannerReasoning, cfg.topic),
+        allQueries,
+      ).slice(0, UNCERTAINTY_MAX_QUERIES);
+    }
 
     if (minedUncertaintyQueries.length > 0) {
       fileStatus(
@@ -913,6 +936,7 @@ void memoryContext;
     gradedCards = [...criticResult.graded, ...criticResult.failed];
 
     if (
+      criticResult.retryWorthy &&
       criticResult.failed.length > 0 &&
       !signal.aborted &&
       !llmManager.signal.aborted &&
@@ -958,7 +982,10 @@ void memoryContext;
 
           // Incrementally grade only the NEW cards against the accepted
           // ledger, then rebuild the graded list aligned to final source order.
+          // Cards graded before the retry are reused as-is so their
+          // critic-sharpened claims and verdicts are not re-derived.
           const rebuiltCards = buildEvidenceCards(allSources, profile);
+          const priorById = new Map(gradedCards.map((g) => [g.id, g]));
           const verdicts = new Map(gradedCards.map((g) => [g.id, g.critic]));
           const newCards = rebuiltCards.filter(
             (c) => !verdicts.has(c.id) && c.verificationTier !== "REJECTED",
@@ -980,11 +1007,14 @@ void memoryContext;
             criticFailCount += retryCritic.failed.length;
             for (const gc of [...retryCritic.graded, ...retryCritic.failed]) {
               verdicts.set(gc.id, gc.critic);
+              priorById.set(gc.id, gc);
             }
           }
           gradedCards = rebuiltCards
             .filter((c) => verdicts.has(c.id))
-            .map((c) => ({ ...c, critic: verdicts.get(c.id)! }));
+            .map(
+              (c) => priorById.get(c.id) ?? { ...c, critic: verdicts.get(c.id)! },
+            );
         }
       }
     }

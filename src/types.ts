@@ -46,6 +46,13 @@ export interface EvidenceCard {
   readonly sourceTier: SourceTier;
   readonly relevantClaim: string;
   readonly supportingExcerpt: string;
+  /**
+   * Resolved (post-redirect) URL the card text was extracted from. Carried into
+   * the verified ledger so citation verification never has to guess provenance.
+   */
+  readonly sourceUrl?: string;
+  /** The `[n]` anchor the synthesis must use for this card. */
+  readonly citationAnchor?: string;
   readonly confidence: "High" | "Medium" | "Low";
   readonly claimStrength: ClaimStrength;
   readonly freshness: string | null;

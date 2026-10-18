@@ -1,5 +1,10 @@
 import { describe, it, expect } from "vitest";
-import { extractUncertaintyQueries } from "../src/swarm/uncertainty-miner";
+import {
+  extractUncertaintyQueries,
+  filterNovelQueries,
+  queryJaccard,
+  shouldMineUncertainty,
+} from "../src/swarm/uncertainty-miner";
 
 describe("extractUncertaintyQueries", () => {
   const topic = "melatonin";
@@ -65,5 +70,108 @@ describe("extractUncertaintyQueries", () => {
     );
     expect(queries.length).toBe(1);
     expect(queries[0].startsWith("the effects of melatonin")).toBe(true);
+  });
+});
+
+describe("filterNovelQueries (Jaccard near-duplicate dedupe)", () => {
+  it("drops a query that is a near-duplicate of one already searched", () => {
+    const novel = filterNovelQueries(
+      ["melatonin long-term effects children"],
+      ["melatonin long term effects in children"],
+    );
+    expect(novel).toEqual([]);
+  });
+
+  it("keeps genuinely novel queries", () => {
+    const novel = filterNovelQueries(
+      ["melatonin paediatric dosing thresholds"],
+      ["melatonin long-term effects children"],
+    );
+    expect(novel).toEqual(["melatonin paediatric dosing thresholds"]);
+  });
+
+  it("dedupes within the incoming batch as well as against prior queries", () => {
+    const novel = filterNovelQueries(
+      [
+        "melatonin receptor binding affinity",
+        "the melatonin receptor binding affinity",
+        "melatonin circadian phase shift",
+      ],
+      [],
+    );
+    expect(novel).toHaveLength(2);
+    expect(novel[0]).toContain("receptor");
+    expect(novel[1]).toContain("circadian");
+  });
+
+  it("reports Jaccard similarity of 1 for identical token sets", () => {
+    expect(queryJaccard("alpha beta gamma", "gamma beta alpha")).toBe(1);
+  });
+
+  it("reports 0 when either query has no tokens", () => {
+    expect(queryJaccard("", "alpha beta")).toBe(0);
+    expect(queryJaccard("!!!", "alpha beta")).toBe(0);
+  });
+});
+
+describe("shouldMineUncertainty (budget gating)", () => {
+  it("allows mining when time and LLM budget are both healthy", () => {
+    expect(
+      shouldMineUncertainty({
+        elapsedFraction: 0.2,
+        remainingLlmCalls: 40,
+        activeWorkers: 5,
+      }),
+    ).toBeNull();
+  });
+
+  it("skips once more than 65% of the hard runtime has elapsed", () => {
+    expect(
+      shouldMineUncertainty({
+        elapsedFraction: 0.66,
+        remainingLlmCalls: 40,
+        activeWorkers: 5,
+      }),
+    ).toBe("time-budget");
+  });
+
+  it("allows mining at the 65% elapsed boundary", () => {
+    expect(
+      shouldMineUncertainty({
+        elapsedFraction: 0.65,
+        remainingLlmCalls: 40,
+        activeWorkers: 5,
+      }),
+    ).toBeNull();
+  });
+
+  it("skips when remaining LLM calls fall below activeWorkers + 3", () => {
+    expect(
+      shouldMineUncertainty({
+        elapsedFraction: 0.1,
+        remainingLlmCalls: 7,
+        activeWorkers: 5,
+      }),
+    ).toBe("llm-budget");
+  });
+
+  it("allows mining exactly at the activeWorkers + 3 boundary", () => {
+    expect(
+      shouldMineUncertainty({
+        elapsedFraction: 0.1,
+        remainingLlmCalls: 8,
+        activeWorkers: 5,
+      }),
+    ).toBeNull();
+  });
+
+  it("always requires the 3-call reserve even with a single worker", () => {
+    expect(
+      shouldMineUncertainty({
+        elapsedFraction: 0.1,
+        remainingLlmCalls: 3,
+        activeWorkers: 1,
+      }),
+    ).toBe("llm-budget");
   });
 });

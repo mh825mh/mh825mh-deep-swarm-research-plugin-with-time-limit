@@ -28,9 +28,10 @@ import {
 import { LlmCallManager, askLoadedModel, askStructured, hasLoadedModel } from "../utils/llm";
 import { extractQwenJson } from "../utils/qwen-parser";
 import { boundEvidenceChunk } from "../utils/text";
-import { passesHeuristicFilter } from "./heuristics";
+import { lexicalScore, passesHeuristicFilter, LexicalTier } from "./heuristics";
 import {
   CRITIC_CARDS_PER_BATCH,
+  CRITIC_EXTRACTED_CLAIM_MAX_CHARS,
   CRITIC_MAX_GRADE_BATCHES,
   CRITIC_LEDGER_CONTEXT_CARDS,
   CRITIC_MAX_TOKENS,
@@ -45,6 +46,17 @@ import {
 const CRITIC_WORKER_ID = "critic";
 const ON_TOPIC_OVERLAP_THRESHOLD = 0.4;
 const STALE_YEARS = 4;
+
+/**
+ * Internal parse result. Extends the internal verdict fragment with the two
+ * flat fields the wire schema carries but the deterministic `CriticVerdict`
+ * shape does not: `extractedClaim` (used to sharpen the card's claim) and
+ * `sourceUrl` (compared against the card's resolved URL for provenance drift).
+ */
+export interface ParsedVerdict extends Partial<CriticVerdict> {
+  readonly extractedClaim?: string;
+  readonly sourceUrl?: string;
+}
 
 export interface RunCriticOptions {
   readonly cards: ReadonlyArray<EvidenceCard>;
@@ -65,6 +77,13 @@ export interface RunCriticResult {
   readonly graded: ReadonlyArray<GradedEvidenceCard>;
   readonly failed: ReadonlyArray<GradedEvidenceCard>;
   readonly callsUsed: number;
+  /**
+   * True when at least one failing card was top-tier by the deterministic
+   * lexical pre-filter. Only then is the orchestrator's bounded retry search
+   * round allowed to spend crawler + LLM budget — low-value failures fall back
+   * deterministically so synthesis is never starved.
+   */
+  readonly retryWorthy: boolean;
 }
 
 interface PreGrade {
@@ -137,32 +156,60 @@ function preGrade(
   };
 }
 
+/** Maps a flat wire verdict onto the internal verdict fragment. */
+function mapFlatVerdict(
+  v: {
+    cardId: string;
+    onTopic: boolean;
+    hasDate: boolean;
+    contradictsLedger: boolean;
+    claimStrength: "high" | "medium" | "low";
+    extractedClaim?: string;
+    sourceUrl?: string;
+  },
+  ledgerIds: ReadonlyArray<string>,
+): ParsedVerdict {
+  const claimStrength: ClaimStrength =
+    v.claimStrength === "high"
+      ? "documented"
+      : v.claimStrength === "medium"
+        ? "disputed"
+        : "speculation";
+  return {
+    cardId: v.cardId,
+    onTopic: v.onTopic,
+    dated: v.hasDate ? "dated" : "undated",
+    // The wire flag is a boolean; attribute the contradiction to the accepted
+    // ledger window the batch was graded against (never to an invented id).
+    contradicts: v.contradictsLedger ? [...ledgerIds] : [],
+    claimStrength,
+    pass: v.onTopic && !v.contradictsLedger,
+    extractedClaim: v.extractedClaim,
+    sourceUrl: v.sourceUrl,
+  };
+}
+
 /**
  * Parses critic output into verdict fragments. First tries schema-validated
  * JSON (item 4 — the primary path, driven by structured output); any failure or
  * non-JSON output falls back to the strict `CARD: ...` line format so one bad
  * batch can't drop the grading round.
+ *
+ * @param ledgerIds ids of the accepted ledger cards this batch was graded
+ *   against; a `contradictsLedger: true` verdict is attributed to them.
  */
 export function parseVerdicts(
   raw: string,
-): ReadonlyMap<string, Partial<CriticVerdict>> {
+  ledgerIds: ReadonlyArray<string> = [],
+): ReadonlyMap<string, ParsedVerdict> {
   try {
     const parsed = extractQwenJson<any>(raw);
     const list = Array.isArray(parsed) ? { verdicts: parsed } : parsed;
     const validated = criticVerdictBatchSchema.safeParse(list);
     if (validated.success && validated.data.verdicts.length > 0) {
-      const out = new Map<string, Partial<CriticVerdict>>();
+      const out = new Map<string, ParsedVerdict>();
       for (const v of validated.data.verdicts) {
-        out.set(v.cardId, {
-          cardId: v.cardId,
-          onTopic: v.onTopic,
-          dated: v.dated,
-          sourceNature: v.sourceNature,
-          contradicts: [...v.contradicts],
-          claimStrength: v.claimStrength,
-          pass: v.pass,
-          note: v.note,
-        });
+        out.set(v.cardId, mapFlatVerdict(v, ledgerIds));
       }
       return out;
     }
@@ -175,10 +222,9 @@ export function parseVerdicts(
 /**
  * Parses the strict per-card critic output lines into verdict fragments.
  * Malformed or unknown lines are skipped so one bad card can't drop a batch.
+ * Kept as the non-JSON fallback for models that ignore the flat JSON schema.
  */
-export function parseCriticLines(
-  raw: string,
-): ReadonlyMap<string, Partial<CriticVerdict>> {
+export function parseCriticLines(raw: string): ReadonlyMap<string, ParsedVerdict> {
   type MutableVerdict = {
     cardId?: string;
     onTopic?: boolean;
@@ -189,7 +235,7 @@ export function parseCriticLines(
     pass?: boolean;
     note?: string;
   };
-  const out = new Map<string, MutableVerdict>();
+  const out = new Map<string, ParsedVerdict>();
   for (const line of raw.split("\n")) {
     const trimmed = line.trim();
     if (!/^CARD:/i.test(trimmed)) continue;
@@ -207,9 +253,14 @@ export function parseCriticLines(
     const onTopic = field("ONTOPIC");
     if (onTopic) verdict.onTopic = onTopic.toUpperCase().startsWith("Y");
 
-    const date = field("DATE");
-    const dateYear = date && !/^NONE$/i.test(date) ? extractYear(date) : null;
-    verdict.dated = dateYear ? classifyYear(dateYear) : "undated";
+    const hasDate = field("HASDATE");
+    if (hasDate) {
+      verdict.dated = hasDate.toUpperCase().startsWith("Y") ? "dated" : "undated";
+    } else {
+      const date = field("DATE");
+      const dateYear = date && !/^NONE$/i.test(date) ? extractYear(date) : null;
+      verdict.dated = dateYear ? classifyYear(dateYear) : "undated";
+    }
 
     const nature = field("NATURE");
     if (nature) {
@@ -245,24 +296,67 @@ export function parseCriticLines(
   return out;
 }
 
+/** Normalized host+path comparison for provenance drift checks. */
+function normalizeUrlForCompare(raw: string): string {
+  try {
+    const u = new URL(raw);
+    u.hash = "";
+    const host = u.hostname.replace(/^www\./, "").toLowerCase();
+    const path = u.pathname.length > 1 ? u.pathname.replace(/\/+$/, "") : u.pathname;
+    return `${host}${path}`;
+  } catch {
+    return raw.trim().toLowerCase();
+  }
+}
+
+/**
+ * Uses the model's `extractedClaim` to sharpen the card's claim text when it is
+ * substantive. Provenance (URL/title/tier) always stays deterministic — only
+ * the claim sentence is allowed to come from the model.
+ */
+function applyExtractedClaim(
+  card: EvidenceCard,
+  parsed: ParsedVerdict | undefined,
+): EvidenceCard {
+  const claim = (parsed?.extractedClaim ?? "").replace(/\s+/g, " ").trim();
+  if (claim.length < 20) return card;
+  return { ...card, relevantClaim: claim.slice(0, CRITIC_EXTRACTED_CLAIM_MAX_CHARS) };
+}
+
 function finalizeVerdict(
   card: EvidenceCard,
   topicKeywords: ReadonlyArray<string>,
-  llm: Partial<CriticVerdict> | undefined,
+  llm: ParsedVerdict | undefined,
 ): CriticVerdict {
   const pre = preGrade(card, topicKeywords);
   const onTopic = llm?.onTopic ?? pre.onTopic;
   const contradicts = llm?.contradicts ?? [];
-  const noteParts = [llm?.note, pre.note].filter(Boolean);
+  const dated = llm?.dated ?? pre.dated;
+  const sourceNature = llm?.sourceNature ?? pre.sourceNature;
+  const claimStrength = llm?.claimStrength ?? card.claimStrength;
+
+  // The note is fully deterministic flag text — the model never supplies prose.
+  const flags = [
+    onTopic ? "on-topic" : "OFF-TOPIC",
+    `date:${dated}`,
+    sourceNature,
+    contradicts.length > 0 ? `conflicts:${contradicts.join(",")}` : "no-conflicts",
+    `strength:${claimStrength}`,
+  ];
+  const claimed = llm?.sourceUrl?.trim();
+  if (claimed && normalizeUrlForCompare(claimed) !== normalizeUrlForCompare(card.canonicalUrl)) {
+    flags.push("url-mismatch");
+  }
+
   return {
     cardId: card.id,
     onTopic,
-    dated: llm?.dated ?? pre.dated,
-    sourceNature: llm?.sourceNature ?? pre.sourceNature,
+    dated,
+    sourceNature,
     contradicts,
-    claimStrength: llm?.claimStrength ?? card.claimStrength,
+    claimStrength,
     pass: onTopic && contradicts.length === 0,
-    note: noteParts.length > 0 ? noteParts.join(" | ") : "no issues flagged",
+    note: `${pre.note} | ${flags.join(" | ")}`,
   };
 }
 
@@ -321,18 +415,17 @@ CARDS TO GRADE:
 ${cardsBlock}
 
 For each card output EXACTLY ONE line:
-CARD: <id> | ONTOPIC: <YES|NO> | DATE: <date text or NONE> | NATURE: <PRIMARY|SECONDARY|UNKNOWN> | CONFLICTS: <NONE|id;id> | STRENGTH: <documented|disputed|anecdote|speculation> | PASS: <YES|NO> | NOTE: <reason, max 160 chars>
+CARD: <id> | ONTOPIC: <YES|NO> | HASDATE: <YES|NO> | CONFLICTS: <NONE|ledger-id;ledger-id> | STRENGTH: <documented|disputed|anecdote|speculation> | PASS: <YES|NO>
 
-(You may instead answer with a single JSON object: { "verdicts": [ one object per card with keys cardId, onTopic, dated, sourceNature, contradicts, claimStrength, pass, note ] }.)
+(Preferred: answer with a single flat JSON object with no prose: { "verdicts": [ { "cardId": "E1", "onTopic": true, "hasDate": true, "contradictsLedger": false, "claimStrength": "high|medium|low", "extractedClaim": "<one sentence supported by the excerpt>", "sourceUrl": "<the card's URL>" } ] }.)
 
 RULES:
 - ONTOPIC NO if the card does not directly support the research topic.
-- PRIMARY = original research / official data; SECONDARY = news or review reporting on primary work; UNKNOWN otherwise.
-- CONFLICTS: list ACCEPTED LEDGER card ids whose stance contradicts this card's claim; NONE if none.
-- STRENGTH: documented only if backed by explicit data or peer review; disputed if contested; anecdote if personal account; else speculation.
-- PASS YES only if ONTOPIC=YES and CONFLICTS=NONE.
-
-OUTPUT:`;
+- HASDATE YES only if the card carries an explicit publication date.
+- CONTRADICTSLEDGER YES if this card's claim conflicts with the ACCEPTED LEDGER above.
+- CLAIMSTRENGTH: high = backed by explicit data or peer review; medium = plausible but contested; low = anecdote or speculation.
+- EXTRACTEDCLAIM: state the card's core claim in one short sentence, using only the excerpt text.
+- OUTPUT: compact JSON only — no explanations, no markdown, no commentary.`;
 }
 
 /**
@@ -347,7 +440,7 @@ async function gradeBatch(
   llmManager: LlmCallManager,
   signal?: AbortSignal,
   skill?: SkillPack,
-): Promise<ReadonlyMap<string, Partial<CriticVerdict>> | null> {
+): Promise<ReadonlyMap<string, ParsedVerdict> | null> {
   if (!llmManager.canCall(CRITIC_WORKER_ID)) return null;
   if (!(await hasLoadedModel())) return null;
 
@@ -364,31 +457,23 @@ async function gradeBatch(
     disableThinking: true,
   };
 
-  // Preferred path: native structured output with a JSON schema; the verdicts
-  // come back pre-validated so the critic never trusts free prose.
+  // Preferred path: native structured output with the flat JSON schema; the
+  // verdicts come back pre-validated so the critic never trusts free prose.
   const structured = await askStructured(prompt, criticVerdictBatchSchema, {
     jsonSchema: criticVerdictBatchJsonSchema,
     ...commonOpts,
   });
   if (structured && structured.verdicts.length > 0) {
-    const map = new Map<string, Partial<CriticVerdict>>();
+    const ledgerIds = ledgerWindow.map((c) => c.id);
+    const map = new Map<string, ParsedVerdict>();
     for (const v of structured.verdicts) {
-      map.set(v.cardId, {
-        cardId: v.cardId,
-        onTopic: v.onTopic,
-        dated: v.dated,
-        sourceNature: v.sourceNature,
-        contradicts: [...v.contradicts],
-        claimStrength: v.claimStrength,
-        pass: v.pass,
-        note: v.note,
-      });
+      map.set(v.cardId, mapFlatVerdict(v, ledgerIds));
     }
     return map;
   }
 
   const raw = await askLoadedModel(prompt, commonOpts);
-  return raw ? parseVerdicts(raw) : null;
+  return raw ? parseVerdicts(raw, ledgerWindow.map((c) => c.id)) : null;
 }
 
 export async function runCritic(options: RunCriticOptions): Promise<RunCriticResult> {
@@ -400,17 +485,22 @@ export async function runCritic(options: RunCriticOptions): Promise<RunCriticRes
 
   // Deterministic fast-path: reject unusable cards before any LLM batch so the
   // critic only spends inference on evidence worth grading.
+  const tiers = new Map<string, LexicalTier>();
+  const scored: Array<{ card: EvidenceCard; score: number }> = [];
   const remaining: EvidenceCard[] = [];
   let heuristicRejected = 0;
   for (const card of cards) {
-    const heuristic = passesHeuristicFilter({
+    const input = {
       url: card.canonicalUrl,
       title: card.title,
       text: `${card.relevantClaim} ${card.supportingExcerpt}`,
       query: topic,
-    });
+    };
+    const heuristic = passesHeuristicFilter(input);
     if (heuristic.pass) {
-      remaining.push(card);
+      const lexical = lexicalScore(input);
+      tiers.set(card.id, lexical.tier);
+      scored.push({ card, score: lexical.score });
       continue;
     }
     heuristicRejected++;
@@ -431,7 +521,13 @@ export async function runCritic(options: RunCriticOptions): Promise<RunCriticRes
     );
   }
 
+  // Grade the strongest lexical candidates first so a truncated batch budget
+  // spends its LLM calls on the evidence most likely to survive the critic.
+  scored.sort((a, b) => b.score - a.score || a.card.id.localeCompare(b.card.id));
+  for (const { card } of scored) remaining.push(card);
+
   let batches = 0;
+  let parseRetryUsed = false;
   while (remaining.length > 0 && batches < CRITIC_MAX_GRADE_BATCHES) {
     const batch = remaining.splice(0, CRITIC_CARDS_PER_BATCH);
     batches++;
@@ -440,7 +536,24 @@ export async function runCritic(options: RunCriticOptions): Promise<RunCriticRes
       break;
     }
 
-    const parsed = await gradeBatch(batch, ledgerWindow.slice(-CRITIC_LEDGER_CONTEXT_CARDS), topic, llmManager, signal, skill);
+    const ledgerContext = ledgerWindow.slice(-CRITIC_LEDGER_CONTEXT_CARDS);
+    let parsed = await gradeBatch(batch, ledgerContext, topic, llmManager, signal, skill);
+
+    // Bounded single retry: a malformed/failed batch is only re-issued when it
+    // contains a top-tier lexical card. Low-value batches fall back to the
+    // deterministic verdicts so the 20% synthesis reserve is preserved.
+    if (
+      !parsed &&
+      !parseRetryUsed &&
+      !signal?.aborted &&
+      !llmManager.shouldStop() &&
+      batch.some((c) => tiers.get(c.id) === "high")
+    ) {
+      parseRetryUsed = true;
+      status?.(`[CRITIC] Batch parse failed on top-tier evidence — retrying once.`);
+      parsed = await gradeBatch(batch, ledgerContext, topic, llmManager, signal, skill);
+    }
+
     if (!parsed) {
       remaining.unshift(...batch);
       break;
@@ -448,8 +561,12 @@ export async function runCritic(options: RunCriticOptions): Promise<RunCriticRes
     callsUsed++;
 
     for (const card of batch) {
-      const verdict = finalizeVerdict(card, topicKeywords, parsed.get(card.id));
-      const gradedCard: GradedEvidenceCard = { ...card, critic: verdict };
+      const parsedVerdict = parsed.get(card.id);
+      const verdict = finalizeVerdict(card, topicKeywords, parsedVerdict);
+      const gradedCard: GradedEvidenceCard = {
+        ...applyExtractedClaim(card, parsedVerdict),
+        critic: verdict,
+      };
       if (verdict.pass) {
         graded.push(gradedCard);
         ledgerWindow.push(card);
@@ -467,9 +584,13 @@ export async function runCritic(options: RunCriticOptions): Promise<RunCriticRes
     else failed.push(gradedCard);
   }
 
+  // A retry round is only worth crawling for if a *strong* card failed —
+  // low-tier failures fall back deterministically.
+  const retryWorthy = failed.some((c) => tiers.get(c.id) === "high");
+
   status?.(
     `[CRITIC] Graded ${graded.length + failed.length} cards (${graded.length} pass, ` +
-      `${failed.length} fail, ${callsUsed} LLM call${callsUsed === 1 ? "" : "s"}).`,
+      `${failed.length} fail, ${callsUsed} LLM call${callsUsed === 1 ? "" : "s"}${retryWorthy ? ", retry-worthy failures" : ""}).`,
   );
   if (failed.length > 0) {
     warn?.(
@@ -477,7 +598,7 @@ export async function runCritic(options: RunCriticOptions): Promise<RunCriticRes
     );
   }
 
-  return { graded, failed, callsUsed };
+  return { graded, failed, callsUsed, retryWorthy };
 }
 
 /**

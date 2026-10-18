@@ -11,11 +11,17 @@ export type ReasoningEffort = "none" | "low" | "medium" | "high";
 
 const THINK_BLOCK_RE = /<think\b[^>]*>[\s\S]*?<\/think>/gi;
 const ORPHAN_THINK_TAG_RE = /<\/?think\b[^>]*>/gi;
+/** A reasoning block whose closing tag never arrived (max-token truncation). */
+const UNCLOSED_THINK_RE = /<think\b[^>]*>[\s\S]*$/i;
 
 /**
  * Removes every `<think>...</think>` block (case-insensitive, multi-line).
  * Repeated passes plus an orphan-tag sweep also clean up nested blocks, which a
  * single non-greedy regex pass would leave behind.
+ *
+ * A reasoning stream can also be cut off mid-block when the max-token limit is
+ * hit, leaving an opening `<think>` with no closing tag; that trailing remainder
+ * is removed too, otherwise it would swallow the JSON payload that follows.
  */
 export function stripThinkTags(raw: string): string {
   if (!raw) return "";
@@ -25,7 +31,9 @@ export function stripThinkTags(raw: string): string {
     prev = out;
     out = out.replace(THINK_BLOCK_RE, "");
   } while (out !== prev);
-  // Sweep up any unbalanced tags a nested block left behind.
+  // Drop an unterminated reasoning prefix/suffix left by truncation.
+  out = out.replace(UNCLOSED_THINK_RE, "");
+  // Sweep up any unbalanced tags a nested or truncated block left behind.
   return out.replace(ORPHAN_THINK_TAG_RE, "");
 }
 

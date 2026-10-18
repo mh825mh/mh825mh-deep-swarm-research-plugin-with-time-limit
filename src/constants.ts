@@ -92,9 +92,15 @@ export function getDepthProfile(preset: DepthPreset): DepthProfile {
 }
 
 export const DDG_RATE_LIMIT_MS = 2_000;
-export const FETCH_TIMEOUT_MS = 10_000;
+/**
+ * Hard per-request timeout for the Tier-1 direct fetch. Kept deliberately tight
+ * (4.5s) so a dead or throttled host fails over to the Tier-2 waterfall
+ * (`got-scraping`) or an alternate engine long before the 2-minute stall
+ * watchdog can trip.
+ */
+export const FETCH_TIMEOUT_MS = 4_500;
 export const IMAGE_FETCH_TIMEOUT_MS = 8_000;
-export const FETCH_MAX_RETRIES = 4;
+export const FETCH_MAX_RETRIES = 3;
 export const FETCH_RETRY_DELAY_MS = 1500;
 export const BATCH_INTER_FETCH_DELAY_MS = 300;
 export const CACHE_FALLBACK_TIMEOUT_MS = 10_000;
@@ -208,9 +214,15 @@ export const EVIDENCE_CHUNK_MAX_CHARS = 6_000;
 export const HEURISTIC_MIN_TEXT_LEN = 180;
 /** Minimum query-keyword overlap ratio a snippet must reach to be graded. */
 export const HEURISTIC_MIN_KEYWORD_OVERLAP = 0.2;
+/** Lexical score at/above which a card is "high tier" (retry-worthy). */
+export const HEURISTIC_HIGH_TIER_SCORE = 0.55;
+/** Lexical score at/above which a card is "medium tier". */
+export const HEURISTIC_MEDIUM_TIER_SCORE = 0.3;
 /** Boilerplate / paywall signatures that make a snippet worthless to grade. */
 export const BOILERPLATE_SIGNATURE_RE =
   /access denied|403 forbidden|please enable javascript|sign in to continue/i;
+/** Max characters of a model-extracted critic claim kept on the card. */
+export const CRITIC_EXTRACTED_CLAIM_MAX_CHARS = 240;
 
 export const SYSTEM_INSTRUCTIONS = `You are a core component of the Deep Swarm Research engine.
 Your goal is to provide precise, high-quality research planning, task decomposition, and findings synthesis.
@@ -234,3 +246,12 @@ Before producing your final answer, reason through these milestones in order:
 export const UNCERTAINTY_MAX_QUERIES = 3;
 /** Per-worker page budget for the epistemic-uncertainty mining round. */
 export const UNCERTAINTY_PAGE_BUDGET = 4;
+/**
+ * Skip uncertainty mining once this fraction of the hard runtime limit has
+ * elapsed (leaves a 15% buffer before the 80% synthesis cutoff).
+ */
+export const UNCERTAINTY_MAX_ELAPSED_FRACTION = 0.65;
+/** LLM calls that must remain after mining, on top of the active worker count. */
+export const UNCERTAINTY_LLM_RESERVE_CALLS = 3;
+/** Jaccard token-overlap at/above which two queries are near-duplicates. */
+export const UNCERTAINTY_JACCARD_THRESHOLD = 0.75;

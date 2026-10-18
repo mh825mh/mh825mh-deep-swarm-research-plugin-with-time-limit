@@ -51,6 +51,21 @@ describe("verifyCitations", () => {
   it("passes with no citations and no urls", () => {
     expect(verifyCitations("Just prose.", LEDGER).pass).toBe(true);
   });
+
+  it("accepts a card's resolved sourceUrl as provenance for that card", () => {
+    const ledger = [
+      {
+        id: "E1",
+        canonicalUrl: "https://example.com/article",
+        sourceUrl: "https://www.example.com/article?utm_source=news",
+        citationAnchor: "[1]",
+      },
+    ];
+    const md = "See https://www.example.com/article?utm_source=news [1].";
+    const result = verifyCitations(md, ledger);
+    expect(result.pass).toBe(true);
+    expect(result.foreignUrls).toEqual([]);
+  });
 });
 
 describe("resolveCitation", () => {

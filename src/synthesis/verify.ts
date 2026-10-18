@@ -18,6 +18,10 @@ const URL_RE = /https?:\/\/[^\s)\]>"'`]+/gi;
 export type VerifyLedgerEntry = {
   readonly id: string;
   readonly canonicalUrl: string;
+  /** Resolved URL carried on the card; preferred for provenance comparison. */
+  readonly sourceUrl?: string;
+  /** `[n]` anchor the card expects the synthesis to use. */
+  readonly citationAnchor?: string;
 };
 
 function indexOfCardId(id: string): number | null {
@@ -56,9 +60,14 @@ export function verifyCitations(
   ledger: ReadonlyArray<VerifyLedgerEntry>,
 ): CitationCheckResult {
   const cardIds = new Set(ledger.map((l) => l.id));
-  const canonicalUrls = new Set(
-    ledger.map((l) => normalizeCompareUrl(l.canonicalUrl)),
-  );
+  // A card's provenance is its resolved (post-redirect) URL when present,
+  // falling back to the canonical URL. Both are registered so a synthesis that
+  // legitimately cites either form still resolves.
+  const canonicalUrls = new Set<string>();
+  for (const entry of ledger) {
+    canonicalUrls.add(normalizeCompareUrl(entry.canonicalUrl));
+    if (entry.sourceUrl) canonicalUrls.add(normalizeCompareUrl(entry.sourceUrl));
+  }
 
   const orphanIndices: string[] = [];
   for (const n of extractInlineIndices(markdown)) {

@@ -9,6 +9,12 @@
  * and its output is unit-testable.
  */
 
+import {
+  UNCERTAINTY_JACCARD_THRESHOLD,
+  UNCERTAINTY_MAX_ELAPSED_FRACTION,
+  UNCERTAINTY_LLM_RESERVE_CALLS,
+} from "../constants";
+
 /** Patterns that indicate the model flagged an epistemic gap. */
 const UNCERTAINTY_PATTERNS: ReadonlyArray<RegExp> = [
   /\b(?:it is |is |remains )?unclear\b/i,
@@ -47,6 +53,79 @@ const STOP_WORDS = new Set([
 
 const MAX_QUERIES = 8;
 const MAX_QUERY_CHARS = 200;
+
+/** Normalized token set for query-similarity comparisons. */
+function queryTokenSet(query: string): Set<string> {
+  const tokens = query
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ")
+    .split(/\s+/)
+    .filter((w) => w.length > 0);
+  return new Set(tokens);
+}
+
+/** Jaccard similarity (0..1) between two queries' normalized token sets. */
+export function queryJaccard(a: string, b: string): number {
+  const left = queryTokenSet(a);
+  const right = queryTokenSet(b);
+  if (left.size === 0 || right.size === 0) return 0;
+  let intersection = 0;
+  for (const token of left) if (right.has(token)) intersection++;
+  const union = left.size + right.size - intersection;
+  return union === 0 ? 0 : intersection / union;
+}
+
+/**
+ * Drops queries that are near-duplicates (Jaccard ≥ `threshold`) of anything
+ * already searched, or of an earlier query in the same batch. This keeps the
+ * bounded mining round from re-searching rephrased versions of a query that was
+ * already executed this run.
+ */
+export function filterNovelQueries(
+  queries: ReadonlyArray<string>,
+  alreadySearched: ReadonlyArray<string>,
+  threshold: number = UNCERTAINTY_JACCARD_THRESHOLD,
+): string[] {
+  const seen = [...alreadySearched];
+  const novel: string[] = [];
+  for (const query of queries) {
+    if (!query || query.trim().length === 0) continue;
+    if (seen.some((prior) => queryJaccard(query, prior) >= threshold)) continue;
+    seen.push(query);
+    novel.push(query);
+  }
+  return novel;
+}
+
+/** Inputs for the wall-clock / LLM-budget gate on the mining wave. */
+export interface UncertaintyBudgetInput {
+  /** Fraction (0..1) of the hard runtime limit already consumed. */
+  readonly elapsedFraction: number;
+  /** LLM calls still available in the global budget. */
+  readonly remainingLlmCalls: number;
+  /** Workers still live that may need LLM calls (plus synthesis). */
+  readonly activeWorkers: number;
+}
+
+/** Why the mining wave is skipped, or `null` when it may proceed. */
+export type UncertaintySkipReason =
+  | "time-budget"
+  | "llm-budget"
+  | null;
+
+/**
+ * Decides whether the optional epistemic-uncertainty mining wave may run.
+ * It must never starve synthesis: skip once more than 65% of the hard runtime
+ * has elapsed (a 15% buffer before the 80% crawl cutoff) or when fewer than
+ * `activeWorkers + 3` LLM calls remain.
+ */
+export function shouldMineUncertainty(input: UncertaintyBudgetInput): UncertaintySkipReason {
+  if (input.elapsedFraction > UNCERTAINTY_MAX_ELAPSED_FRACTION) return "time-budget";
+  if (input.remainingLlmCalls < Math.max(1, input.activeWorkers) + UNCERTAINTY_LLM_RESERVE_CALLS) {
+    return "llm-budget";
+  }
+  return null;
+}
 
 /** Splits a reasoning trace into sentence/clause fragments. */
 function splitClauses(thinkBlock: string): ReadonlyArray<string> {

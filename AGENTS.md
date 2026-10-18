@@ -58,14 +58,33 @@ Work in the current project only. Never treat `$HOME`, `AppData`, or other repos
 
 ## Project commands
 
-Fill these in for this repo and keep them accurate:
+- Build: `npm run build` (`tsc` → emits `dist/`)
+- Typecheck: `npm run typecheck` (`tsc --noEmit`)
+- Test all: `npm run test` (`vitest run`)
+- Test single suite: `npx vitest run tests/<suite>.test.ts`
+- Lint / format: none configured. Do not invent one; match the existing style.
 
-- Dev / run:
-- Test:
-- Lint / format:
-- Build:
+`prebuild` runs `scripts/sync-version.mjs`, which checks that `package.json`
+`version` and `manifest.json` `revision` stay synchronized. If a command is
+unknown, look it up in README / package scripts. Do not guess.
 
-If a command is unknown, look it up in README / Gradle / package scripts. Do not guess.
+## Architecture constraints
+
+- Local-first: the swarm always searches local RAG libraries before the web, and
+  prefers free scraped engines. Paid APIs (Serper, Brave, Decodo) are optional
+  and must degrade cleanly to free scraping when their keys are absent.
+- Global LLM concurrency semaphore: every prediction flows through
+  `utils/llm.ts` `LlmSemaphore` (default `1` — one LM Studio kv-cache slot).
+  Never bypass it when adding an LLM call.
+- Time budget: the wall-clock limit reserves 20% for verification + synthesis
+  (`orchestrator.ts` `crawlDeadline = start + effectiveRuntime * 0.80`). Crawling
+  must never starve synthesis.
+- SSRF: all fetches go through the `net/ssrf.ts` guard; internal/private/rebound
+  hosts are rejected before any request.
+- Qwen reasoning: `<think>` blocks are stripped by `utils/qwen-parser.ts` BEFORE
+  any `JSON.parse` / Zod validation. Never parse raw model output directly.
+- Critic wire schema (`planning/schemas.ts`) is deliberately flat (primitives and
+  enums only) so small local models can emit valid structured output.
 
 ## Edit rules
 

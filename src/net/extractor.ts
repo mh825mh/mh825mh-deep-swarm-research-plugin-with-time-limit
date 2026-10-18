@@ -91,6 +91,32 @@ function stripBoilerplate(doc: Document): void {
   } catch {}
 }
 
+/**
+ * Nodes removed from the cloned document immediately before Readability /
+ * Turndown / chunking. These never contain evidence prose but bloat the token
+ * budget and can carry prompt-injection payloads, so they are dropped
+ * explicitly (in addition to the broader `stripBoilerplate` sweep).
+ */
+const HARD_STRIP_SELECTORS: ReadonlyArray<string> = [
+  "script",
+  "style",
+  "noscript",
+  "svg",
+  "nav",
+  "footer",
+  "header",
+];
+
+function stripNonContentNodes(doc: Document | Element): void {
+  for (const selector of HARD_STRIP_SELECTORS) {
+    try {
+      for (const el of Array.from(doc.querySelectorAll(selector))) el.remove();
+    } catch {
+      /* ignore unsupported selector */
+    }
+  }
+}
+
 const DEFAULT_MAX_OUTLINKS = 40;
 
 export function extractPage(
@@ -210,6 +236,8 @@ function extractText(
 
   try {
     const cloned = doc.cloneNode(true) as Document;
+    // Drop non-content nodes from the clone before Readability/Turndown sees it.
+    stripNonContentNodes(cloned);
     const article = new Readability(cloned, {
       classesToPreserve: ["table", "data-table", "code", "pre", "highlight", "math", "latex", "language-"],
       charThreshold: 100,
@@ -239,6 +267,8 @@ function extractText(
   const stripped = fallbackHtml
     .replace(/<script[\s\S]*?<\/script>/gi, "")
     .replace(/<style[\s\S]*?<\/style>/gi, "")
+    .replace(/<noscript[\s\S]*?<\/noscript>/gi, "")
+    .replace(/<svg[\s\S]*?<\/svg>/gi, "")
     .replace(/<nav[\s\S]*?<\/nav>/gi, "")
     .replace(/<header[\s\S]*?<\/header>/gi, "")
     .replace(/<footer[\s\S]*?<\/footer>/gi, "")

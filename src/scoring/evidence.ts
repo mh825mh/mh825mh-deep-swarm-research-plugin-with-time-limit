@@ -62,6 +62,10 @@ export function buildEvidenceCards(
       title: s.title,
       authorOrHost: domain,
       canonicalUrl: s.url,
+      // Provenance travels with the card: the resolved URL plus the exact `[n]`
+      // anchor the synthesis is expected to emit.
+      sourceUrl: s.finalUrl || s.url,
+      citationAnchor: `[${i + 1}]`,
       sourceTier: s.tier,
       relevantClaim: boundEvidenceChunk(
         s.description || s.text.slice(0, claimChars),

@@ -210,38 +210,58 @@ describe("buildRetryQueries", () => {
 });
 
 describe("parseVerdicts (item 4 structured output)", () => {
-  it("parses structured JSON batches into verdict fragments", () => {
+  it("maps the flat wire verdict onto the internal verdict fragment", () => {
     const raw = JSON.stringify({
       verdicts: [
         {
           cardId: "E1",
           onTopic: true,
-          dated: "dated",
-          sourceNature: "primary",
-          contradicts: ["E2"],
-          claimStrength: "documented",
-          pass: false,
-          note: "conflicts E2",
+          hasDate: true,
+          contradictsLedger: true,
+          claimStrength: "high",
+          extractedClaim: "The trial documented a controlled effect.",
+          sourceUrl: "https://example.com/a",
         },
       ],
     });
-    const map = parseVerdicts(raw);
+    // `contradictsLedger` is attributed to the accepted ledger window ids.
+    const map = parseVerdicts(raw, ["E2", "E3"]);
     expect(map.size).toBe(1);
     const v = map.get("E1");
     expect(v?.pass).toBe(false);
-    expect(v?.contradicts).toEqual(["E2"]);
+    expect(v?.contradicts).toEqual(["E2", "E3"]);
+    expect(v?.dated).toBe("dated");
     expect(v?.claimStrength).toBe("documented");
+    expect(v?.extractedClaim).toBe("The trial documented a controlled effect.");
+    expect(v?.sourceUrl).toBe("https://example.com/a");
   });
 
-  it("accepts a bare array of verdicts", () => {
+  it("maps low/high flat claim strength onto the internal enum", () => {
+    const raw = JSON.stringify({
+      verdicts: [
+        {
+          cardId: "E4",
+          onTopic: true,
+          hasDate: false,
+          contradictsLedger: false,
+          claimStrength: "low",
+        },
+      ],
+    });
+    const v = parseVerdicts(raw).get("E4");
+    expect(v?.dated).toBe("undated");
+    expect(v?.claimStrength).toBe("speculation");
+    expect(v?.pass).toBe(true);
+  });
+
+  it("accepts a bare array of flat verdicts", () => {
     const raw = JSON.stringify([
       {
         cardId: "E7",
         onTopic: true,
-        dated: "undated",
-        sourceNature: "secondary",
-        claimStrength: "disputed",
-        pass: true,
+        hasDate: false,
+        contradictsLedger: false,
+        claimStrength: "medium",
       },
     ]);
     const map = parseVerdicts(raw);

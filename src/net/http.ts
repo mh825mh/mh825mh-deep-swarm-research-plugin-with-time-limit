@@ -4,6 +4,7 @@ import * as http from "node:http";
 import { setServers } from "node:dns";
 import { isPrivateUrl, isRiskyUrl } from "./ssrf";
 import { createArchiveController } from "./archiver";
+import { FETCH_MAX_RETRIES, FETCH_TIMEOUT_MS } from "../constants";
 
 const DNS_RESOLVERS = ["1.1.1.1", "1.0.0.1", "8.8.8.8", "8.8.4.4", "9.9.9.9"];
 setServers(DNS_RESOLVERS);
@@ -57,8 +58,8 @@ export interface FetchResult {
   readonly statusCode?: number;
 }
 
-const FETCH_TIMEOUT_MS = 12000;
-const FETCH_MAX_RETRIES = 3;
+// Tier-1 direct fetch timeout is defined in constants.ts (FETCH_TIMEOUT_MS =
+// 4.5s) so the orchestration budget and the fetch layer cannot drift apart.
 
 // Proxy support (optional)
 const PROXY_URL = process.env.HTTP_PROXY || process.env.HTTPS_PROXY;
@@ -89,46 +90,61 @@ export async function fetchPage(
     // Delay to prevent burst blocking
     await new Promise((resolve) => setTimeout(resolve, 2500));
 
+    let tierOneTimedOut = false;
     try {
       const headers = { ...buildBrowserHeaders(url), ...customHeaders };
       const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-      
-      const res = await fetch(url, { 
-        method, 
-        body,
-        signal: controller.signal, 
-        headers, 
-        redirect: "follow"
-      });
-      
-      clearTimeout(timeout);
+      const timeout = setTimeout(() => {
+        tierOneTimedOut = true;
+        controller.abort();
+      }, FETCH_TIMEOUT_MS);
 
-      // If blocked by Cloudflare/WAF, fall back to Wayback Machine immediately
-      if ([403, 429, 503].includes(res.status)) {
-        throw new Error(`HTTP ${res.status}`);
+      try {
+        const res = await fetch(url, {
+          method,
+          body,
+          signal: controller.signal,
+          headers,
+          redirect: "follow"
+        });
+
+        // If blocked by Cloudflare/WAF, fall back to Wayback Machine immediately
+        if ([403, 429, 503].includes(res.status)) {
+          throw new Error(`HTTP ${res.status}`);
+        }
+
+        const contentType = res.headers.get("content-type") || "";
+        const finalUrl = res.url || url;
+
+        if (contentType.includes("application/pdf") || contentType.includes("application/octet-stream")) {
+          const arrayBuf = await res.arrayBuffer();
+          return { html: "", finalUrl, contentType, rawBuffer: Buffer.from(arrayBuf), statusCode: res.status };
+        }
+
+        const html = await res.text();
+
+        // Only check for very specific captcha markers, avoid generic words like "blocked"
+        if (html.includes("cf-challenge") || html.includes("hcaptcha") || html.includes("recaptcha")) {
+          throw new Error("Captcha page detected");
+        }
+
+        return { html, finalUrl, contentType, statusCode: res.status };
+      } finally {
+        clearTimeout(timeout);
       }
-
-      const contentType = res.headers.get("content-type") || "";
-      const finalUrl = res.url || url;
-
-      if (contentType.includes("application/pdf") || contentType.includes("application/octet-stream")) {
-        const arrayBuf = await res.arrayBuffer();
-        return { html: "", finalUrl, contentType, rawBuffer: Buffer.from(arrayBuf), statusCode: res.status };
-      }
-
-      const html = await res.text();
-      
-      // Only check for very specific captcha markers, avoid generic words like "blocked"
-      if (html.includes("cf-challenge") || html.includes("hcaptcha") || html.includes("recaptcha")) {
-        throw new Error("Captcha page detected");
-      }
-
-      return { html, finalUrl, contentType, statusCode: res.status };
     } catch (err: unknown) {
-      if (err instanceof DOMException && err.name === "AbortError") throw err;
+      // Real cancellation (outer run signal) always propagates.
+      if (signal.aborted) throw new DOMException("Aborted", "AbortError");
+
+      // Hard Tier-1 budget exhausted: do not retry a dead host. Throw so the
+      // caller falls through to Tier 2 (got-scraping / FlareSolverr / Decodo)
+      // and finally the archive tier, keeping the run inside the stall window.
+      if (tierOneTimedOut) {
+        throw new Error(`Tier-1 fetch timed out after ${FETCH_TIMEOUT_MS}ms`);
+      }
+
       lastError = err;
-      
+
       // Exponential backoff
       const backoffTime = 5000 * Math.pow(2, attempt);
       await new Promise((resolve) => setTimeout(resolve, backoffTime));

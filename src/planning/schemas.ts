@@ -5,7 +5,7 @@
 // zodToJsonSchema converter covers exactly the vocabulary these schemas use, so
 // the JSON Schema can never drift from the validator.
 import { z } from "zod";
-import { ClaimStrength, WorkerRole } from "../types";
+import { WorkerRole } from "../types";
 
 export const WORKER_ROLES: ReadonlyArray<WorkerRole> = [
   "breadth",
@@ -43,23 +43,21 @@ export const researchPlanSchema = z.object({
 });
 export type ResearchPlanParsed = z.infer<typeof researchPlanSchema>;
 
-const CLAIM_STRENGTHS: ReadonlyArray<ClaimStrength> = [
-  "documented",
-  "disputed",
-  "anecdote",
-  "speculation",
-];
-const CLAIM_STRENGTH_ENUM = z.enum(CLAIM_STRENGTHS as [ClaimStrength, ...ClaimStrength[]]);
-
+/**
+ * Critic wire schema (LLM-facing). Deliberately FLAT — primitives, booleans, and
+ * small enums only, with no nested objects, arrays of objects, or free-form
+ * prose. Small local models (Qwen 3.8) emit valid structured output far more
+ * reliably this way, and the internal `CriticVerdict` is reconstructed from
+ * these flags deterministically in `scoring/critic.ts`.
+ */
 export const criticVerdictSchema = z.object({
   cardId: z.string().min(1),
   onTopic: z.boolean(),
-  dated: z.enum(["dated", "undated", "stale"]),
-  sourceNature: z.enum(["primary", "secondary", "unknown"]),
-  contradicts: z.array(z.string()).default([]),
-  claimStrength: CLAIM_STRENGTH_ENUM,
-  pass: z.boolean(),
-  note: z.string().default(""),
+  hasDate: z.boolean(),
+  contradictsLedger: z.boolean(),
+  claimStrength: z.enum(["high", "medium", "low"]),
+  extractedClaim: z.string().default(""),
+  sourceUrl: z.string().default(""),
 });
 export type CriticVerdictParsed = z.infer<typeof criticVerdictSchema>;
 

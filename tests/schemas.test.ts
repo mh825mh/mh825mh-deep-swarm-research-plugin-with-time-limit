@@ -85,22 +85,37 @@ describe("researchPlanSchema", () => {
 });
 
 describe("criticVerdictBatchSchema", () => {
-  it("validates a batch of verdicts with defaults applied", () => {
+  it("validates a flat batch of verdicts with defaults applied", () => {
     const batch = criticVerdictBatchSchema.parse({
       verdicts: [
         {
           cardId: "E1",
           onTopic: true,
-          dated: "dated",
-          sourceNature: "primary",
-          contradicts: ["E2"],
-          claimStrength: "documented",
-          pass: false,
+          hasDate: true,
+          contradictsLedger: false,
+          claimStrength: "high",
         },
       ],
     });
-    expect(batch.verdicts[0].note).toBe("");
-    expect(batch.verdicts[0].contradicts).toEqual(["E2"]);
+    // Flat, prose-free wire shape: only primitives, booleans, and enums.
+    expect(batch.verdicts[0].extractedClaim).toBe("");
+    expect(batch.verdicts[0].sourceUrl).toBe("");
+    expect(batch.verdicts[0].hasDate).toBe(true);
+    expect(batch.verdicts[0].contradictsLedger).toBe(false);
+  });
+
+  it("rejects a batch missing required booleans", () => {
+    expect(
+      criticVerdictBatchSchema.safeParse({
+        verdicts: [
+          {
+            cardId: "E1",
+            onTopic: true,
+            claimStrength: "high",
+          },
+        ],
+      }).success,
+    ).toBe(false);
   });
 
   it("rejects a batch with an unknown claimStrength", () => {
@@ -110,18 +125,26 @@ describe("criticVerdictBatchSchema", () => {
           {
             cardId: "E1",
             onTopic: true,
-            dated: "dated",
-            sourceNature: "primary",
+            hasDate: true,
+            contradictsLedger: false,
             claimStrength: "maybe",
-            pass: true,
           },
         ],
       }).success,
     ).toBe(false);
   });
 
-  it("the generated JSON schema exposes the enum values", () => {
+  it("the generated JSON schema exposes the flat verdict enum + array", () => {
     const props = (criticVerdictBatchJsonSchema as any).properties as Record<string, any>;
     expect(props.verdicts.type).toBe("array");
+    const verdict = props.verdicts.items as Record<string, any>;
+    // Second level only: primitive-typed properties, no nested objects.
+    expect(verdict.properties.claimStrength.enum).toEqual(["high", "medium", "low"]);
+    expect(verdict.properties.onTopic.type).toBe("boolean");
+    expect(verdict.properties.hasDate.type).toBe("boolean");
+    expect(verdict.properties.contradictsLedger.type).toBe("boolean");
+    for (const value of Object.values(verdict.properties) as any[]) {
+      expect(value.type === "object" || value.type === "array").toBe(false);
+    }
   });
 });
