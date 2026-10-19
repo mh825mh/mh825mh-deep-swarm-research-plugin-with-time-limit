@@ -4,6 +4,44 @@ All notable changes to `lms-plugin-deep-swarm-research`, newest first. See `READ
 
 ---
 
+## 🚀 What's New in v5.10.0?
+
+Latency, zero-source resilience, and KV-cache efficiency for local Qwen-class
+models.
+
+* **Qwen 3.8 fast-call mode (`optimizeForQwen38`):** the gatekeeper, critic, and
+  query-mutation micro-calls now prefill an empty `<think>\n</think>\n` block and
+  append `/no_think`, so a one-word YES/NO or a short verdict can't be truncated
+  inside a reasoning trace. Planner and synthesis keep full reasoning.
+* **Tier-0 keyless JSON pre-seeder (`seedFromTierZeroJsonApis`):** OpenAlex and
+  the Wikipedia REST API run concurrently (hard <3.5s cap) at the start of the
+  external layers, before DDG/Bing/SearXNG, and promote verified reference cards
+  straight into the evidence ledger. Zero-source runs can no longer stall the
+  watchdog.
+* **Intra-page BM25 windowing (`extractTopBm25Windows`):** evidence excerpts are
+  now the top BM25-scored paragraphs across the whole page (reading order
+  preserved, with heading/number boosts) instead of a blind top-of-page slice, so
+  mid-article data reaches the critic and synthesis.
+* **Topic-adaptive fallback planner (`selectAdaptiveFallbackDimensions`):** when
+  LLM planning is unavailable the deterministic path emits the top 4
+  topic-matched dimensions (scientific / technical / market / generic) instead of
+  a blind 12-dimension dump.
+* **KV-cache-pinned system prefix (`buildKvCachePinnedMessages`):** the planner,
+  critic, and synthesis now share a byte-identical `STATIC_SWARM_SYSTEM_PREFIX`
+  (plus the run's `[DOMAIN RUBRIC]`) so LM Studio reuses its prefix KV cache
+  across sequential calls.
+* **In-run singleflight URL dedupe (`SingleflightUrlFetcher`):** concurrent
+  workers fetching the same URL collapse into one HTTP / FlareSolverr / Decodo
+  request; savings are logged per run and the cache resets every run.
+* **Pre-fetch SERP snippet gate (`shouldFetchSerpCandidate`):** login/cart/tag
+  URLs and results with no core-topic term are dropped by title + snippet before
+  any page fetch (followed in-page links are exempt).
+* **Skill-pack fallback (`resolveSkillPackWithFallback`):** unmatched domain tags
+  now fall back to a topic-classified pack (academic / market / policy) instead
+  of leaving the run with `[SKILL] none`.
+
+---
+
 ## 🚀 What's New in v5.9.1?
 
 Local-model hardening: less wasted inference, fewer stalls, and no model prose

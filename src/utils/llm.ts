@@ -182,6 +182,9 @@ function applyNoThink<T extends { role: string; content: string }>(
   const copy = [...messages];
   for (let i = copy.length - 1; i >= 0; i--) {
     if (copy[i].role === "user") {
+      // Skip if the prompt already carries a trailing /no_think directive (the
+      // Qwen fast-call optimizer appends one), so we never emit it twice.
+      if (/\n?\/no_think\s*$/.test(copy[i].content)) break;
       copy[i] = { ...copy[i], content: `${copy[i].content}\n/no_think` };
       break;
     }

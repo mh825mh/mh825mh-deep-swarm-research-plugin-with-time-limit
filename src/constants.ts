@@ -136,6 +136,12 @@ export const REPORT_SOURCE_PREVIEW_CHARS = 1500;
 export const MULTI_READ_BATCH_DELAY_MS = 500;
 export const DIMENSION_COVERAGE_MIN_HITS = 3;
 export const DIMENSION_COVERAGE_MIN_CHARS = 200;
+/**
+ * When the LLM planner is unavailable, gap-fill is deterministic and derived
+ * from DIMENSIONS (ordered by priority). Cap it to the top N core dimensions
+ * instead of fanning out to all ~12, which produces a low-signal task wave.
+ */
+export const FALLBACK_CORE_DIMENSIONS = 4;
 export const AI_SYNTHESIS_MAX_TOKENS = 3_000;
 export const AI_SYNTHESIS_TEMPERATURE = 0.35;
 export const AI_SYNTHESIS_TIMEOUT_MS = 30_000;

@@ -14,6 +14,7 @@ import {
 } from "../types";
 import { DepthProfile } from "../constants";
 import { boundEvidenceChunk } from "../utils/text";
+import { extractTopBm25Windows } from "../utils/qwenOptimizer";
 
 export function buildEvidenceCards(
   sources: ReadonlyArray<CrawledSource>,
@@ -70,7 +71,12 @@ export function buildEvidenceCards(
       relevantClaim: boundEvidenceChunk(
         s.description || s.text.slice(0, claimChars),
       ),
-      supportingExcerpt: boundEvidenceChunk(s.text.slice(0, excerptChars)),
+      // Intra-page BM25 windowing (item 3): keep the paragraphs most relevant to
+      // the query that found this page instead of the raw top-of-page slice, so
+      // data buried mid-article still reaches the critic and synthesis.
+      supportingExcerpt: boundEvidenceChunk(
+        extractTopBm25Windows(s.text, s.sourceQuery || s.title, excerptChars),
+      ),
       confidence:
         s.relevanceScore > 0.6
           ? "High"

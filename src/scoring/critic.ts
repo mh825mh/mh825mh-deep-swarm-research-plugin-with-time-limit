@@ -28,6 +28,8 @@ import {
 import { LlmCallManager, askLoadedModel, askStructured, hasLoadedModel } from "../utils/llm";
 import { extractQwenJson } from "../utils/qwen-parser";
 import { boundEvidenceChunk } from "../utils/text";
+import { optimizeForQwen38 } from "../utils/qwenOptimizer";
+import { buildKvCachePinnedMessages } from "../swarm/singleflightAndSnippetGate";
 import { lexicalScore, passesHeuristicFilter, LexicalTier } from "./heuristics";
 import {
   CRITIC_CARDS_PER_BATCH,
@@ -46,6 +48,15 @@ import {
 const CRITIC_WORKER_ID = "critic";
 const ON_TOPIC_OVERLAP_THRESHOLD = 0.4;
 const STALE_YEARS = 4;
+
+/**
+ * Static critic identity/rules. Kept in the SYSTEM message (via the KV-cache
+ * pinner) so the byte-identical prefix is reused across every grading batch in
+ * a run instead of being rebuilt inside the user payload.
+ */
+const CRITIC_SYSTEM_PROMPT =
+  "You are a VERIFIER critic, NOT a researcher. You cannot search and must not propose queries. " +
+  "You grade ONLY the evidence cards provided in the user message against the research topic.";
 
 /**
  * Internal parse result. Extends the internal verdict fragment with the two
@@ -377,7 +388,6 @@ function buildBatchPrompt(
   batch: ReadonlyArray<EvidenceCard>,
   ledgerWindow: ReadonlyArray<EvidenceCard>,
   topic: string,
-  skill?: SkillPack,
 ): string {
   const ledgerBlock =
     ledgerWindow.length > 0
@@ -407,7 +417,6 @@ function buildBatchPrompt(
 
 TOPIC: "${topic}"
 
-${skill ? `SKILL PACK APPLIED — "${skill.name}" v${skill.version}: follow its conventions when judging relevance and nature.\n${skill.content}\n` : ""}
 ACCEPTED LEDGER (evidence already accepted — check cards against these):
 ${ledgerBlock}
 
@@ -445,8 +454,24 @@ async function gradeBatch(
   if (!(await hasLoadedModel())) return null;
 
   llmManager.recordCall(CRITIC_WORKER_ID);
-  const prompt = buildBatchPrompt(batch, ledgerWindow, topic, skill);
+  const prompt = buildBatchPrompt(batch, ledgerWindow, topic);
+
+  // KV-cache pinning: the system prefix (static engine identity + domain rubric)
+  // is byte-identical across every grading batch in a run, so LM Studio reuses
+  // its prefix cache instead of re-prefilling. Only the cards stay per-batch.
+  const pinned = buildKvCachePinnedMessages(
+    skill?.content,
+    "CRITIC VERIFICATION",
+    prompt,
+    true,
+  );
+  // Qwen fast-call: append /no_think so a verdict never gets truncated inside a
+  // <think> block. The token budget stays CRITIC_MAX_TOKENS because a batch
+  // carries more cards than the plan's single-card estimate.
+  const optimized = optimizeForQwen38("critic", CRITIC_SYSTEM_PROMPT, pinned.user);
+  const criticSystem = `${pinned.system}\n\n${CRITIC_SYSTEM_PROMPT}`;
   const commonOpts = {
+    system: criticSystem,
     maxTokens: CRITIC_MAX_TOKENS,
     temperature: CRITIC_TEMPERATURE,
     timeoutMs: CRITIC_TIMEOUT_MS,
@@ -459,7 +484,7 @@ async function gradeBatch(
 
   // Preferred path: native structured output with the flat JSON schema; the
   // verdicts come back pre-validated so the critic never trusts free prose.
-  const structured = await askStructured(prompt, criticVerdictBatchSchema, {
+  const structured = await askStructured(optimized.userPrompt, criticVerdictBatchSchema, {
     jsonSchema: criticVerdictBatchJsonSchema,
     ...commonOpts,
   });
@@ -472,7 +497,7 @@ async function gradeBatch(
     return map;
   }
 
-  const raw = await askLoadedModel(prompt, commonOpts);
+  const raw = await askLoadedModel(optimized.userPrompt, commonOpts);
   return raw ? parseVerdicts(raw, ledgerWindow.map((c) => c.id)) : null;
 }
 

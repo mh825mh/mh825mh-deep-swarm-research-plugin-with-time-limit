@@ -10,7 +10,8 @@
  */
 
 import { LMStudioClient } from "@lmstudio/sdk";
-import { buildPredictionOptions, withThinkingDirective } from "../utils/llm";
+import { buildPredictionOptions } from "../utils/llm";
+import { optimizeForQwen38 } from "../utils/qwenOptimizer";
 
 export type GateDecision = "yes" | "no" | "error" | "unavailable";
 
@@ -42,15 +43,26 @@ export async function topicNeedsLocalSources(
     const model = await client.llm.model(models[0].identifier);
 
     const gatePrompt = `Topic: "${topic}". Does this query explicitly ask for personal, internal, or company documents? Answer ONLY YES or NO.`;
-    const messages = withThinkingDirective(
-      [{ role: "user" as const, content: gatePrompt }],
-      { reasoningEffort: "none", disableThinking: true },
+    // Micro-call fast path: prefill an empty <think> block and append /no_think
+    // so Qwen 3.8 never burns (or gets truncated inside) a reasoning trace for a
+    // one-word YES/NO decision.
+    const optimized = optimizeForQwen38(
+      "gatekeeper",
+      "You are a precise binary classifier. Reply with a single word.",
+      gatePrompt,
     );
+    const messages: Array<{ role: string; content: string }> = [
+      { role: "system", content: optimized.systemPrompt },
+      { role: "user", content: optimized.userPrompt },
+    ];
+    if (optimized.assistantPrefill) {
+      messages.push({ role: "assistant", content: optimized.assistantPrefill });
+    }
     const stream = model.respond(
       messages as never,
       buildPredictionOptions({
-        maxTokens: 10,
-        temperature: 0.1,
+        maxTokens: optimized.maxTokens,
+        temperature: optimized.temperature,
         reasoningEffort: "none",
         disableThinking: true,
       }) as never,

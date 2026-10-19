@@ -1,6 +1,7 @@
 import { logLlmDiagnostics } from "../utils/tokens";
 import { askLoadedModel, askStructured, ReasoningCapture } from "../utils/llm";
 import { extractQwenJson } from "../utils/qwen-parser";
+import { buildKvCachePinnedMessages } from "../swarm/singleflightAndSnippetGate";
 import {
   QueryPlan,
   WorkerRole,
@@ -36,8 +37,12 @@ import {
   THINKING_PROTOCOL,
 } from "../constants";
 
-/** Planner system prompt: base engine instructions plus the thinking rubric. */
-const PLANNER_SYSTEM = `${SYSTEM_INSTRUCTIONS}\n\n${THINKING_PROTOCOL}`;
+/**
+ * Planner system prompt. Begins with the shared `STATIC_SWARM_SYSTEM_PREFIX`
+ * (from the KV-cache pinner) so the planner reuses the same warm prefix as the
+ * later critic/synthesis calls within a run, then adds the thinking rubric.
+ */
+const PLANNER_SYSTEM = `${buildKvCachePinnedMessages(undefined, "PLANNER", "").system}\n\n${SYSTEM_INSTRUCTIONS}\n\n${THINKING_PROTOCOL}`;
 
 async function callLoadedModel(
   prompt: string,

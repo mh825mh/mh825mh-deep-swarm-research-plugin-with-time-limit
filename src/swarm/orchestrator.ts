@@ -1,4 +1,4 @@
-import { runWorker, CrawlMetrics } from "./worker";
+import { runWorker, CrawlMetrics, urlSingleflight } from "./worker";
 import { SwarmBlackboard } from "./blackboard";
 import { topicNeedsLocalSources } from "../local/gatekeeper";
 import { extractUncertaintyQueries, filterNovelQueries, shouldMineUncertainty } from "./uncertainty-miner";
@@ -8,6 +8,10 @@ import {
   summariseFindings,
 } from "../planning/planner";
 import { detectCoveredDimensions, DIMENSIONS, detectGaps } from "../planning/dimensions";
+import { seedFromTierZeroJsonApis } from "../net/tierZeroJsonSeeder";
+import { selectAdaptiveFallbackDimensions } from "./singleflightAndSnippetGate";
+import { resolveSkillPackWithFallback } from "../utils/qwenOptimizer";
+import { loadSkillPack } from "../skills/loader";
 import {
   ResearchConfig,
   SwarmTask,
@@ -24,7 +28,7 @@ import {
   SkillPack,
   BlockedUrlEntry,
 } from "../types";
-import { DepthProfile, CRITIC_RETRY_MAX_TASKS, CRITIC_RETRY_PAGE_BUDGET, UNCERTAINTY_MAX_QUERIES, UNCERTAINTY_PAGE_BUDGET } from "../constants";
+import { DepthProfile, CRITIC_RETRY_MAX_TASKS, CRITIC_RETRY_PAGE_BUDGET, UNCERTAINTY_MAX_QUERIES, UNCERTAINTY_PAGE_BUDGET, FALLBACK_CORE_DIMENSIONS } from "../constants";
 import { DdgLimiterPool, resetThrottle } from "../net/ddg";
 import { resetArchiveSession, getArchiveState } from "../net/http";
 import { VisitedPageCache, normalizeUrl, type VisitedCacheStats } from "./visited-cache";
@@ -37,6 +41,7 @@ import { selectSkillForTags, skillLabel } from "../skills/select";
 import { getEngineStats, getLearnedHints } from "./learning";
 import { persistRunMemory } from "../memory/persist";
 import { retrieveMemoryForTopic } from "../memory/retrieve";
+import { querySiblingPluginCaches, withHardTimeout } from "./pluginBridgeAndPacer";
 import { probeFlareSolverr, resetFsStats } from "../net/waterfallFetcher";
 import { resetDecodoSession, setDecodoToken, getDecodoStats } from "../net/decodoApi";
 import fs from "node:fs";
@@ -51,13 +56,100 @@ type GapPlanLike = {
   readonly preferredTiers?: ReadonlyArray<SourceTier>;
 };
 
+/**
+ * Convert a sibling-plugin cache hit (telegram-rag-cache / rss-rag-cache)
+ * into a CrawledSource so it flows through the normal evidence-card → critic
+ * → synthesis pipeline instead of needing a bespoke card type. Conservative
+ * domain/freshness scores keep these cached items out of the top authority
+ * tiers; the critic still grades them like any other source.
+ */
+function siblingHitToCrawledSource(
+  hit: { title: string; url: string; content: string; timestamp?: string; score: number },
+  sourceQuery: string,
+): CrawledSource {
+  const publishedMs = hit.timestamp ? Date.parse(hit.timestamp) : NaN;
+  const ageDays = Number.isNaN(publishedMs) ? null : Math.max(0, (Date.now() - publishedMs) / 86_400_000);
+  return {
+    url: hit.url,
+    finalUrl: hit.url,
+    title: hit.title.slice(0, 200),
+    description: hit.content.slice(0, 300),
+    published: hit.timestamp ?? null,
+    text: hit.content,
+    wordCount: hit.content.split(/\s+/).filter(Boolean).length,
+    outlinks: [],
+    sourceQuery,
+    workerRole: "breadth",
+    workerLabel: "Feeds (sibling cache)",
+    domainScore: 70,
+    freshnessScore: ageDays === null ? 50 : Math.max(0, 100 - Math.min(100, ageDays)),
+    tier: "reference",
+    relevanceScore: Math.max(0.3, Math.min(1, hit.score)),
+    origin: "web",
+    discoveredBy: "sibling-cache",
+  };
+}
+
+/**
+ * Promote a Tier-0 keyless JSON seed card (OpenAlex / Wikipedia REST) into a
+ * CrawledSource so it flows through the normal evidence-card → critic →
+ * synthesis pipeline. These are the guaranteed baseline citations that let a run
+ * survive a total HTML-engine rate-limit without tripping the stall watchdog.
+ */
+function tierZeroSeedToCrawledSource(
+  card: { url: string; title: string; content: string; engine: string },
+  sourceQuery: string,
+): CrawledSource {
+  const isAcademic = card.engine === "openalex" || card.engine === "crossref";
+  return {
+    url: card.url,
+    finalUrl: card.url,
+    title: card.title.slice(0, 200),
+    description: card.content.slice(0, 300),
+    published: null,
+    text: card.content,
+    wordCount: card.content.split(/\s+/).filter(Boolean).length,
+    outlinks: [],
+    sourceQuery,
+    workerRole: isAcademic ? "academic" : "breadth",
+    workerLabel: isAcademic ? "Tier-0 Academic JSON" : "Tier-0 Reference JSON",
+    domainScore: isAcademic ? 88 : 84,
+    freshnessScore: 60,
+    tier: isAcademic ? "academic" : "reference",
+    relevanceScore: 0.82,
+    origin: "web",
+    discoveredBy: `tier0-${card.engine}`,
+  };
+}
+
+/**
+ * Flatten the structured cross-run MemoryContext (episodic runs, semantic
+ * facts, procedural wins, known-good/bad hosts) into a compact text block the
+ * blackboard can carry into task synthesis.
+ */
+function renderMemoryContext(ctx: ReturnType<typeof retrieveMemoryForTopic>): string {
+  const lines: string[] = [];
+  for (const run of ctx.runs.slice(0, 3)) {
+    lines.push(`- prior run "${run.topic}" gathered ${run.sourceCount} source(s) via ${run.engineHits.filter((e) => e.hits > 0).map((e) => e.engine).join(", ") || "unknown engines"}`);
+  }
+  for (const fact of ctx.facts.slice(0, 6)) {
+    lines.push(`- ${fact.kind}: ${fact.text}`);
+  }
+  for (const proc of ctx.procedures.slice(0, 5)) {
+    lines.push(`- proven ${proc.kind}: ${proc.label}`);
+  }
+  if (ctx.goodEngines.length > 0) lines.push(`- engines that worked before: ${ctx.goodEngines.join(", ")}`);
+  if (ctx.failedHosts.length > 0) lines.push(`- hosts that failed before (skip unless nothing else): ${ctx.failedHosts.slice(0, 8).join(", ")}`);
+  return lines.join("\n");
+}
+
 function zeroMetrics(): CrawlMetrics {
   return {
     ddgQueries: 0, ddgHits: 0, mutatedQueriesTried: 0, mutationAccepted: 0,
     mutationHits: 0, extraEngineQueries: 0, extraEngineHits: 0, rawHits: 0,
     dedupedHits: 0, rankedCandidates: 0, fetchCandidates: 0, fetchAttempts: 0,
     fetchFailures: 0, acceptedSources: 0, skippedLowWordCount: 0, skippedOffTopic: 0,
-    skippedVeryOffTopic: 0, skippedDuplicateContent: 0, skippedVisited: 0,
+    skippedSnippetGate: 0, skippedVeryOffTopic: 0, skippedDuplicateContent: 0, skippedVisited: 0,
     skippedDomainCap: 0, skippedAvoided: 0, skippedBlacklisted: 0, skippedNegativeCache: 0,
     cacheChecks: 0,
     cacheHits: 0, cacheAccepted: 0, cacheRejectedDuplicate: 0, cacheRejectedOffTopic: 0,
@@ -547,6 +639,9 @@ export async function runSwarm(
   resetFsStats();
   resetDecodoSession();
   setDecodoToken(cfg.decodoApiToken);
+  // item 1: reset the shared singleflight cache so a new run never serves a page
+  // fetched (or a stale body cached) during a previous run.
+  urlSingleflight.reset();
   const runStartedAt = Date.now();
 
   // item 5: bound parallel LLM predictions (default 1 — a single kv-cache slot).
@@ -599,17 +694,40 @@ export async function runSwarm(
   topic: cfg.topic,
   topicKeywords: plan.topicKeywords,
 });
-void memoryContext;
+
+  // Merge the internal BM25 cross-run memory with hits from the
+  // khtsly/persistent-memory sibling plugin cache, so both feed the blackboard
+  // (and downstream task synthesis) instead of the old `void memoryContext`
+  // seam that discarded everything. Sibling reads are local and synchronous.
+  const siblingMemories = querySiblingPluginCaches([cfg.topic], 5)
+    .filter((h) => h.sourcePlugin === "persistent-memory")
+    .map((h) => `- [${h.title}]: ${h.content.slice(0, 400)}`)
+    .join("\n");
+
+  const internalMemoryText = renderMemoryContext(memoryContext);
+  const effectiveMemoryContext = [internalMemoryText, siblingMemories]
+    .filter((s) => Boolean(s && s.trim().length > 0))
+    .join("\n\n");
   const roles = rolesForProfile(profile);
   const pool = new DdgLimiterPool(profile.searchLanes, profile.ddgRateLimitMs);
 
   // item 8: auto-select a skill pack from the planner's domain tags and apply
   // it to the critic + synthesis prompts. Available without LLM calls.
-  const skill = selectSkillForTags(plan.domainTags ?? []) ?? undefined;
+  let skill = selectSkillForTags(plan.domainTags ?? []) ?? undefined;
   if (skill) {
     fileStatus(
       `[SKILL] Auto-selected pack "${skill.name}" v${skill.version} from tags: ${(plan.domainTags ?? []).join(", ")}${skill.userOverride ? " (user override)" : " (bundled)"}`,
     );
+  } else {
+    // item 4: never leave an investigative/empirical topic with "[SKILL] none".
+    // Unmatched tags fall back to a topic-classified default pack.
+    const fallbackName = resolveSkillPackWithFallback(cfg.topic, plan.domainTags ?? []);
+    skill = loadSkillPack(fallbackName) ?? undefined;
+    if (skill) {
+      fileStatus(
+        `[SKILL] No tag match — falling back to "${skill.name}" v${skill.version} (topic-classified)${skill.userOverride ? " (user override)" : " (bundled)"}.`,
+      );
+    }
   }
 
   // Time budget: keep min(session, LLM mode cap) for a finite session. A value
@@ -628,6 +746,17 @@ void memoryContext;
   // item 5: the shared blackboard — plan, gaps, cards, blocked_urls, time_left.
   const blackboard = new SwarmBlackboard(() => state.listBlockedUrls(), crawlDeadline);
   blackboard.attachPlan(plan.researchPlan ?? null);
+
+  // Publish the merged cross-run + sibling-plugin memory onto the blackboard
+  // so workers and the synthesis pass can read one coordination surface.
+  if (effectiveMemoryContext) {
+    blackboard.setMemoryContext(effectiveMemoryContext);
+    fileStatus(
+      `[MEMORY] Injected ${effectiveMemoryContext.length} chars of prior cross-run` +
+        (siblingMemories ? " + persistent-memory plugin" : "") +
+        ` context.`,
+    );
+  }
 
   // ==========================================
   // LAYER 1: THE AI RAG GATEKEEPER
@@ -667,11 +796,64 @@ void memoryContext;
   // LAYERS 2-5: EXTERNAL GAP-DRIVEN SEARCH
   // ==========================================
   fileStatus(`\n🌐 LAYERS 2-5: External Gap-Driven Search...`);
-  
+
+  // ==========================================
+  // TIER-0: KEYLESS JSON PRE-SEED (item 2)
+  // ==========================================
+  // Run OpenAlex + Wikipedia REST before ANY HTML engine so every run secures a
+  // handful of verified reference cards in <3.5s. This disarms the stall
+  // watchdog and guarantees baseline Tier-A/B citations even when DDG/SearXNG are
+  // fully rate-limited (the run_log_… "Zero-Source Run" failure mode).
+  if (
+    (cfg.enableAcademicAPIs || cfg.enableReferenceSearch) &&
+    !signal.aborted &&
+    Date.now() < crawlDeadline
+  ) {
+    fileStatus(`\n⚡ TIER-0: Pre-seeding verified keyless JSON sources (OpenAlex + Wikipedia REST)...`);
+    try {
+      const seedCards = await seedFromTierZeroJsonApis(
+        cfg.topic,
+        cfg.crossrefMailto,
+        fileStatus,
+      );
+      if (seedCards.length > 0) {
+        for (const card of seedCards) {
+          allSources.push(tierZeroSeedToCrawledSource(card, cfg.topic));
+          state.addVisited(card.url);
+        }
+        fileStatus(
+          `✅ Tier-0 JSON pre-seed added ${seedCards.length} verified reference source(s) before HTML engines.`,
+        );
+      } else {
+        fileStatus(`[TIER-0] No JSON reference cards returned — relying on HTML engines.`);
+      }
+    } catch (e) {
+      fileWarn(
+        `[TIER-0] Pre-seed failed (${e instanceof Error ? e.message : String(e)}) — continuing with HTML engines.`,
+      );
+    }
+  }
+
   const coveredIds = detectCoveredDimensions(allSources.map(s => s.text));
-  const gaps = detectGaps(coveredIds);
-  
-  for (const gap of gaps) {
+
+  // Deterministic fallback (item 3): when the LLM planner was unavailable,
+  // replace the blind 12-dimension dump with the topic-adaptive top-N
+  // dimensions, then let the LLM-planned runs use the full uncovered set.
+  const allGaps = detectGaps(coveredIds);
+  const fallbackDims = plan.usedAI
+    ? []
+    : selectAdaptiveFallbackDimensions(cfg.topic, FALLBACK_CORE_DIMENSIONS);
+  if (!plan.usedAI) {
+    fileStatus(
+      `[PLAN] Deterministic fallback: topic-adaptive plan (${fallbackDims.length} dimension(s): ${fallbackDims.map(d => d.name).join(" | ")}).`,
+    );
+  }
+
+  const recordedGaps: ReadonlyArray<{ id: string; label: string }> = plan.usedAI
+    ? allGaps.map(g => ({ id: g.id, label: g.label }))
+    : fallbackDims.map(d => ({ id: d.id, label: d.name }));
+
+  for (const gap of recordedGaps) {
     if (signal.aborted) break;
     blackboard.addGap(gap.label);
     health.gaps.push({
@@ -686,12 +868,21 @@ void memoryContext;
     });
   }
 
-  let externalTasks = buildGapTasks(gaps.map(g => ({
-    role: "breadth", 
-    label: `Gap: ${g.label}`,
-    queries: g.queries(cfg.topic),
-    followLinks: true
-  })) as ReadonlyArray<GapPlanLike>, 1, profile, cfg).map(task => {
+  const gapPlanInputs: ReadonlyArray<GapPlanLike> = plan.usedAI
+    ? allGaps.map(g => ({
+        role: "breadth" as WorkerRole,
+        label: `Gap: ${g.label}`,
+        queries: g.queries(cfg.topic),
+        followLinks: true,
+      }))
+    : fallbackDims.map(d => ({
+        role: "breadth" as WorkerRole,
+        label: `Gap: ${d.name}`,
+        queries: d.queries,
+        followLinks: true,
+      }));
+
+  let externalTasks = buildGapTasks(gapPlanInputs, 1, profile, cfg).map(task => {
     // ENCYCLOPEDIA FORCING: Append site operators for academic/breadth roles
     if (cfg.enableReferenceSearch && (task.role === "academic" || task.role === "breadth")) {
       return {
@@ -724,7 +915,10 @@ void memoryContext;
 
   // Dedicated feeds pass: when RSS feeds / Telegram channels are configured,
   // query them once for the topic (plus the top planned queries) instead of
-  // adding them to every worker's engine set.
+  // adding them to every worker's engine set. The sibling-plugin cache bridge
+  // (telegram-rag-cache / rss-rag-cache) seeds first so a cache hit skips the
+  // network entirely, and the live pass is hard-capped at 12s so it can never
+  // stall long enough to trip the 2-minute watchdog.
   if (
     !signal.aborted &&
     !llmManager.signal.aborted &&
@@ -742,18 +936,44 @@ void memoryContext;
       .filter((q, i, arr) => arr.indexOf(q) === i)
       .slice(0, 3);
 
-    fileStatus(`\n📡 FEEDS: Querying ${feedEngines.join(", ")} for ${feedQueries.length} quer${feedQueries.length === 1 ? "y" : "ies"}...`);
-    const feedTask: SwarmTask = {
-      ...buildStaticTask("breadth", feedQueries, profile, cfg),
-      label: "Feeds",
-      extraEngines: feedEngines,
-    };
-    const feedResults = await runTaskGroup(
-      [feedTask], state, pool, signal, fileStatus, fileWarn, plan.topicKeywords, health, llmManager,
+    // 1) Sibling plugin caches first — local, instant, no rate-limit risk.
+    const cachedFeedHits = querySiblingPluginCaches(feedQueries, 10).filter(
+      (h) => h.sourcePlugin === "telegram-rag-cache" || h.sourcePlugin === "rss-rag-cache",
     );
-    const prevFeedCount = allSources.length;
-    aggregateResults(feedResults, allSources, allQueries, allErrors);
-    fileStatus(`✅ Feeds pass complete. Added ${allSources.length - prevFeedCount} source(s).`);
+    if (cachedFeedHits.length > 0) {
+      const prevCachedCount = allSources.length;
+      for (const hit of cachedFeedHits) {
+        allSources.push(siblingHitToCrawledSource(hit, feedQueries[0] ?? cfg.topic));
+      }
+      fileStatus(
+        `📡 [Feeds] Loaded ${allSources.length - prevCachedCount} cached item(s) from sibling RSS/Telegram plugins.`,
+      );
+    }
+
+    // 2) Live network feeds only when the cache under-delivered (< 3 hits),
+    //    bounded by a 12s hard timeout regardless of engine behavior.
+    if (cachedFeedHits.length < 3) {
+      fileStatus(`\n📡 FEEDS: Querying ${feedEngines.join(", ")} for ${feedQueries.length} quer${feedQueries.length === 1 ? "y" : "ies"}...`);
+      const feedTask: SwarmTask = {
+        ...buildStaticTask("breadth", feedQueries, profile, cfg),
+        label: "Feeds",
+        extraEngines: feedEngines,
+      };
+      const feedResults = await withHardTimeout(
+        runTaskGroup(
+          [feedTask], state, pool, signal, fileStatus, fileWarn, plan.topicKeywords, health, llmManager,
+        ),
+        12_000,
+        [] as WorkerResult[],
+        "Feeds",
+        fileWarn,
+      );
+      const prevFeedCount = allSources.length;
+      aggregateResults(feedResults, allSources, allQueries, allErrors);
+      fileStatus(`✅ Feeds pass complete. Added ${allSources.length - prevFeedCount} source(s).`);
+    } else {
+      fileStatus(`✅ [Feeds] Sibling cache returned ${cachedFeedHits.length} hit(s) — skipping live RSS/Telegram pass.`);
+    }
   }
 
   for (const layer of ["DDG", "SEARXNG", "DIRECT", "API"]) {
@@ -1061,6 +1281,14 @@ void memoryContext;
   // ==========================================
   fileStatus(health.generateReport());
   fileStatus(llmManager.getReport());
+
+  // item 1: report how many concurrent duplicate URL fetches singleflight saved.
+  {
+    const sf = urlSingleflight.getStats();
+    fileStatus(
+      `[SINGLEFLIGHT] Deduped ${sf.dedupedRequestsSaved} concurrent duplicate URL fetch(es); ${sf.cachedUrls} URL(s) served from the in-run fetch cache.`,
+    );
+  }
 
   if (hardStopTimer) {
     clearTimeout(hardStopTimer);

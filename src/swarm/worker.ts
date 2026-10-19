@@ -24,6 +24,9 @@ import {
   wasLastSearchRateLimited,
 } from "../net/ddg";
 import { multiEngineSearch, SearchEngine } from "../net/search-engines";
+import { globalEnginePacer, ENGINE_PACE_MIN_INTERVAL_MS } from "./pluginBridgeAndPacer";
+import { SingleflightUrlFetcher, shouldFetchSerpCandidate } from "./singleflightAndSnippetGate";
+import { optimizeForQwen38 } from "../utils/qwenOptimizer";
 import { SearchHealthTracker } from "./health";
 import { fetchPage, sleep, maybeArchivePage } from "../net/http";
 import {
@@ -62,6 +65,16 @@ import {
 import { normalizeUrl } from "./visited-cache";
 import { getEngineStats, getMutationStats, getDomainAdjustments } from "./learning";
 
+/**
+ * Shared in-run singleflight fetcher. Every worker's network fetch for a URL
+ * funnels through here, so concurrent duplicate candidates collapse into a
+ * single HTTP / FlareSolverr / Decodo request. The orchestrator resets it at the
+ * start of each run (and logs its savings at the end).
+ */
+export const urlSingleflight = new SingleflightUrlFetcher<
+  Awaited<ReturnType<typeof fetchWithWaybackFallback>>
+>();
+
 export interface CrawlMetrics {
   ddgQueries: number;
   ddgHits: number;
@@ -79,6 +92,7 @@ export interface CrawlMetrics {
   acceptedSources: number;
   skippedLowWordCount: number;
   skippedOffTopic: number;
+  skippedSnippetGate: number;
   skippedVeryOffTopic: number;
   skippedDuplicateContent: number;
   skippedVisited: number;
@@ -164,6 +178,7 @@ function zeroMetrics(): CrawlMetrics {
     mutationHits: 0, extraEngineQueries: 0, extraEngineHits: 0, rawHits: 0,
     dedupedHits: 0, rankedCandidates: 0, fetchCandidates: 0, fetchAttempts: 0,
     fetchFailures: 0, acceptedSources: 0, skippedLowWordCount: 0, skippedOffTopic: 0,
+    skippedSnippetGate: 0,
     skippedVeryOffTopic: 0, skippedDuplicateContent: 0, skippedVisited: 0, skippedDomainCap: 0,
     skippedAvoided: 0, skippedBlacklisted: 0, skippedNegativeCache: 0, cacheChecks: 0, cacheHits: 0, cacheAccepted: 0,
     cacheRejectedDuplicate: 0, cacheRejectedOffTopic: 0, cacheRejectedLowWordCount: 0,
@@ -233,10 +248,17 @@ export async function runWorker(
         const humanDelay = Math.floor(Math.random() * 6000) + 2000;
         await sleep(humanDelay);
 
+        // Serialize DDG requests globally: lane limiters allow parallel lanes,
+        // which lets several workers fire within milliseconds. The global pacer
+        // spaces same-engine requests (jittered) so 202 bans stop happening.
         if (task.searchPages > 1) {
-          ddgHits = await searchDDGPaginated(query, task.searchResultsPerQuery, task.searchPages, task.safeSearch, signal, limiter, task.timeRange ?? "all", task.flaresolverrUrl);
+          ddgHits = await globalEnginePacer.schedule("ddg", ENGINE_PACE_MIN_INTERVAL_MS, () =>
+            searchDDGPaginated(query, task.searchResultsPerQuery, task.searchPages, task.safeSearch, signal, limiter, task.timeRange ?? "all", task.flaresolverrUrl),
+          );
         } else {
-          ddgHits = await searchDDG(query, task.searchResultsPerQuery, task.safeSearch, signal, limiter, task.timeRange ?? "all", task.flaresolverrUrl);
+          ddgHits = await globalEnginePacer.schedule("ddg", ENGINE_PACE_MIN_INTERVAL_MS, () =>
+            searchDDG(query, task.searchResultsPerQuery, task.safeSearch, signal, limiter, task.timeRange ?? "all", task.flaresolverrUrl),
+          );
         }
 
         // LOWERED TRIPWIRE: If it finds even 1 result, that is a success.
@@ -513,13 +535,15 @@ async function fetchBatch(
   tag: string,
   topicKws: ReadonlyArray<string>,
   metrics: CrawlMetrics,
-  llmManager: LlmCallManager
+  llmManager: LlmCallManager,
+  applySnippetGate: boolean = true,
 ): Promise<void> {
   let idx = 0;
   const concurrency = task.workerConcurrency;
   const domainCap = task.maxPagesPerDomain;
   const minRelevance = task.minRelevanceScore;
   const domainPolicy = buildDomainPolicyFromTask(task);
+  const gateTopic = task.queries.join(" ");
 
   while (results.length < task.pageBudget && idx < candidates.length && !signal.aborted) {
     const slice = candidates.slice(idx, idx + concurrency);
@@ -535,6 +559,17 @@ async function fetchBatch(
       if (state.shouldAvoidUrl(c.url)) { metrics.skippedAvoided++; continue; }
       if (state.isDomainBlacklisted(c.url)) { metrics.skippedBlacklisted++; continue; }
       if (state.isRejected(c.url)) { metrics.skippedNegativeCache++; continue; }
+      // Pre-fetch SERP snippet gate (item 2): reject jargon/login-wall results by
+      // title + snippet BEFORE spending an HTTP / FlareSolverr / Decodo request.
+      // Followed in-page links skip this gate (they carry no title/snippet).
+      if (applySnippetGate) {
+        const gate = shouldFetchSerpCandidate(
+          { url: c.url, title: c.title, snippet: c.snippet, engine: c.discoveredBy ?? "unknown" },
+          gateTopic,
+          task.label,
+        );
+        if (!gate.allow) { metrics.skippedSnippetGate++; continue; }
+      }
       batch.push(c);
     }
 
@@ -680,7 +715,7 @@ async function followLinks(
   const before = results.length;
   const linkCandidates = toFollow.map((l) => scoreCandidate({ url: l.href, title: "", snippet: "" }, task.queries[0] ?? ""));
 
-  await fetchBatch(linkCandidates, { ...task, pageBudget: results.length + budget }, state, signal, status, warn, results, errors, tag, topicKws, metrics, llmManager);
+  await fetchBatch(linkCandidates, { ...task, pageBudget: results.length + budget }, state, signal, status, warn, results, errors, tag, topicKws, metrics, llmManager, false);
 
   return results.length - before;
 }
@@ -701,7 +736,12 @@ async function fetchAndExtract(
     if (!ytData) throw new Error("YouTube transcript extraction failed");
     page = buildYouTubePage(url, ytData, task.contentLimit, 1);
   } else {
-    const fetchResult = await fetchWithWaybackFallback(url, signal, task);
+    // Singleflight (item 1): collapse concurrent fetches of the same URL across
+    // workers into one network request — the visited-page cache only fills after
+    // a page is accepted, so parallel workers otherwise race the same URL.
+    const fetchResult = await urlSingleflight.fetchOnce(url, (normalized) =>
+      fetchWithWaybackFallback(normalized, signal, task),
+    );
     const { finalUrl } = fetchResult;
     const maxChunks = Math.max(1, task.extractPagesPerSource ?? 1);
 
@@ -789,9 +829,17 @@ async function getLLMQueryMutation(
   logLlmDiagnostics("getLLMQueryMutation", prompt);
 
   if (signal.aborted) return null;
-  const mutated = await askLoadedModel(prompt, {
-    maxTokens: 40,
-    temperature: 0.7,
+  // Qwen fast-call: a one-line mutation is a micro-call — suppress reasoning
+  // tokens so it can never stall or truncate inside a <think> block.
+  const optimized = optimizeForQwen38(
+    "mutator",
+    "You generate one alternative web-search query. Output the raw query only.",
+    prompt,
+  );
+  const mutated = await askLoadedModel(optimized.userPrompt, {
+    system: optimized.systemPrompt,
+    maxTokens: optimized.maxTokens,
+    temperature: optimized.temperature,
     timeoutMs: 15_000,
     signal,
     // Repetitive one-line generation — reasoning tokens are pure overhead.

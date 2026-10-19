@@ -5,15 +5,19 @@ searches your local documents and the web, adapts its strategy, verifies claims,
 and synthesizes everything into a structured, confidence-scored report with
 auditable citations — all in one tool call.
 
-- Version: **5.9.1**
+- Version: **5.10.0**
 - Runtime: local-first (no cloud required)
 - History: see [`CHANGELOG.md`](./CHANGELOG.md)
 
-> **New in 5.9.1:** flat (prose-free) critic wire schema for small local models,
-> tiered lexical gating so the critic never grades boilerplate, a hardened
-> `<think>` parser that survives max-token truncation, budget-gated uncertainty
-> mining with Jaccard query dedupe, and a strict 4.5s Tier-1 fetch timeout that
-> fails over to the free waterfall instead of stalling.
+> **New in 5.10.0:** a Qwen 3.8 fast-call mode (empty `<think>` prefill +
+> `/no_think`) so the gatekeeper, critic, and query mutator never stall inside a
+> reasoning block; a Tier-0 keyless JSON pre-seeder (OpenAlex + Wikipedia REST)
+> that lands verified citations in <3.5s before any HTML engine; intra-page BM25
+> windowing so the critic and synthesis read the most relevant paragraphs instead
+> of the page top; a topic-adaptive fallback planner; a KV-cache-pinned system
+> prefix shared across planner → critic → synthesis; in-run singleflight URL
+> dedupe; a pre-fetch SERP snippet gate; and a skill-pack fallback that ends
+> `[SKILL] none`.
 
 ## ⚡ Quick start
 
@@ -85,16 +89,24 @@ Run the plugin once to auto-generate the file location.
 ## 🧠 How it works
 
 1. **Plan** — the topic is decomposed into up to 10 specialized worker roles,
-   emitted as a validated JSON plan (with a deterministic fallback).
+   emitted as a validated JSON plan (with a deterministic, topic-adaptive
+   fallback).
 2. **Local first** — local RAG libraries are always searched before the web;
    if local evidence is sufficient, the web layer is skipped.
-3. **Gap-driven web search** — queries target missing dimensions. Free engines
+3. **Tier-0 JSON pre-seed** — keyless OpenAlex + Wikipedia REST feeds verified
+   reference cards into the ledger in under ~3.5s, *before* any HTML engine can
+   be rate-limited, so a run never ends with zero citations.
+4. **Gap-driven web search** — queries target missing dimensions. Free engines
    run first; paid APIs are held in reserve.
-4. **Anti-block fetching** — a waterfall cascades direct fetch → `got-scraping`
-   → FlareSolverr → Wayback Machine (plus Decodo when configured).
-5. **Critic / verifier** — every evidence card is graded (deterministic
+5. **Anti-block fetching** — a waterfall cascades direct fetch → `got-scraping`
+   → FlareSolverr → Wayback Machine (plus Decodo when configured). A pre-fetch
+   snippet gate drops junk/login-wall URLs and in-run singleflight collapses
+   concurrent duplicate URL fetches.
+6. **Critic / verifier** — every evidence card is graded (deterministic
    pre-score + batched LLM pass); only failing claims trigger one bounded retry.
-6. **Synthesize & verify** — an isolated synthesis pass writes the report, then
+   Pages are BM25-windowed first, so only the most relevant paragraphs are
+   graded.
+7. **Synthesize & verify** — an isolated synthesis pass writes the report, then
    an independent verifier confirms every `[n]` citation and URL resolves to the
    ledger.
 

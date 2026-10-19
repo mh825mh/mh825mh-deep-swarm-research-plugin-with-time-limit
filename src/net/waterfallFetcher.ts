@@ -63,6 +63,16 @@ export function getFsStats(): Readonly<FlareSolverrStats> {
   return { ...fsStats };
 }
 
+/**
+ * True when a configured FlareSolverr endpoint has been probed and did NOT
+ * answer the ready check. Callers (the fetch waterfall and the search-HTML
+ * fallback) should skip the bypass tier entirely so an unreachable endpoint
+ * never racks up per-URL doomed attempts.
+ */
+export function isFlareSolverrKnownUnreachable(): boolean {
+  return fsStats.probed && fsStats.reachable === false;
+}
+
 /** Set by the run-start probe; used by Tier B to remember whether the endpoint
  * answered the connectivity check. */
 let fsReachableConfirmed = false;
@@ -210,7 +220,10 @@ export async function fetchWithWaterfall(
   // ==========================================
   // TIER B: FlareSolverr (Optional Headless Bypass)
   // ==========================================
-  if (flaresolverrUrl && flaresolverrUrl.trim() !== '') {
+  // Gated on the run-start probe: when the endpoint is known-unreachable, the
+  // whole tier is skipped so an unreachable FlareSolverr never executes dozens
+  // of doomed per-URL attempts (or trips its own timeouts).
+  if (flaresolverrUrl && flaresolverrUrl.trim() !== '' && !isFlareSolverrKnownUnreachable()) {
     fsStats.configured = true;
     // One-time liveness verification: if a run-start probe never succeeded,
     // don't waste per-fetch time dialing a dead endpoint.

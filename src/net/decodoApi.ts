@@ -71,6 +71,34 @@ function noteFailure(error: string): void {
 }
 
 /**
+ * Target-side outcomes (the proxy fetched the page but the TARGET site
+ * returned a non-2xx status, a stub/empty body, or a bot challenge). The
+ * Decodo transport itself is healthy, so these must NOT advance the
+ * consecutive-failure circuit breaker — otherwise five DDG 202 challenges
+ * arriving through Decodo disable the whole tier.
+ */
+function noteTargetOutcome(error: string): void {
+  stats.lastError = `${error} (target-side; not counted against Decodo)`;
+}
+
+/** Bot-challenge / stub-page markers shared with the DDG and waterfall tiers.
+ * Kept deliberately specific — generic words like "captcha" appear in legit
+ * articles and would false-positive healthy pages. */
+const CHALLENGE_MARKERS = [
+  "Just a moment...",
+  "cf-browser-verification",
+  "Attention Required! | Cloudflare",
+  "Enable JavaScript and cookies to continue",
+  "bots use DuckDuckGo too much",
+  "unusual traffic from your computer network",
+];
+
+function looksLikeChallengeOrStub(html: string): boolean {
+  if (html.trim().length < 250) return true;
+  return CHALLENGE_MARKERS.some((marker) => html.includes(marker));
+}
+
+/**
  * Fetches `url` through the Decodo Web Scraping API and returns the rendered
  * HTML, or null when Decodo is not configured / the request failed. Never
  * throws (a broken endpoint simply falls through to other tiers).
@@ -115,39 +143,59 @@ export async function fetchViaDecodo(
       return null;
     }
 
-    const data = (await res.json()) as {
-      results?: ReadonlyArray<{
-        content?: unknown;
-        status_code?: number;
-      }>;
-    };
+    // The API responds with a JSON envelope whose `results[0].content` is a
+    // JSON-encoded string of the target HTML. Some responses instead carry a
+    // flat envelope (`content` / `body` / `html` at the top level) or raw
+    // HTML — unwrap all three shapes.
+    const rawText = await res.text();
+    let html: string | null = null;
+    let targetStatus = res.status;
 
-    const first = data.results?.[0];
-    const statusCode = first?.status_code ?? res.status;
-    if (!first || statusCode < 200 || statusCode >= 300) {
-      noteFailure(`Target HTTP ${statusCode}`);
-      return null;
-    }
-
-    // `content` is a JSON-encoded string of the target HTML. Decode it;
-    // if it is not valid JSON it is treated as raw HTML.
-    let html: string;
-    if (typeof first.content === "string") {
+    if (rawText.trimStart().startsWith("{")) {
       try {
-        const decoded = JSON.parse(first.content);
-        html = typeof decoded === "string" ? decoded : JSON.stringify(decoded);
+        const parsed = JSON.parse(rawText) as {
+          results?: ReadonlyArray<{ content?: unknown; status_code?: number }>;
+          content?: unknown;
+          body?: unknown;
+          html?: unknown;
+        };
+        const first = parsed.results?.[0];
+        targetStatus = first?.status_code ?? res.status;
+        const candidate =
+          first?.content ?? parsed.content ?? parsed.body ?? parsed.html;
+        if (typeof candidate === "string") {
+          try {
+            const decoded = JSON.parse(candidate);
+            html = typeof decoded === "string" ? decoded : JSON.stringify(decoded);
+          } catch {
+            html = candidate;
+          }
+        } else if (typeof candidate === "object" && candidate !== null) {
+          html = JSON.stringify(candidate);
+        }
       } catch {
-        html = first.content;
+        // Not valid JSON after all — fall through and treat it as raw HTML.
       }
-    } else if (typeof first.content === "object" && first.content !== null) {
-      html = JSON.stringify(first.content);
-    } else {
-      noteFailure("Decodo response missing content");
+    }
+    if (html === null) html = rawText;
+
+    // Target-level non-2xx (e.g. DDG 202 rate-limit, 403 from the site): the
+    // Decodo proxy itself answered fine. Do NOT poison the circuit breaker.
+    if (targetStatus < 200 || targetStatus >= 300) {
+      noteTargetOutcome(`Target HTTP ${targetStatus}`);
       return null;
     }
 
     if (!html || html.trim().length === 0) {
-      noteFailure("Decodo returned empty content");
+      noteTargetOutcome("Decodo returned empty content");
+      return null;
+    }
+
+    // Target returned 200 but the body is a stub or bot-challenge page — again
+    // a target-side outcome, so let the caller fall through to the next engine
+    // without counting a Decodo transport failure.
+    if (looksLikeChallengeOrStub(html)) {
+      noteTargetOutcome("Target HTTP 200 with challenge/stub page");
       return null;
     }
 

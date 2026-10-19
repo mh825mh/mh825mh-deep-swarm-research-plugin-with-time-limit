@@ -2,8 +2,9 @@
 import type { SearchHit } from "../types";
 import { DdgRateLimiter, searchDDG } from "./ddg";
 import { buildBrowserHeaders, fetchPage } from "./http";
-import { fetchWithWaterfall } from "./waterfallFetcher";
+import { fetchWithWaterfall, isFlareSolverrKnownUnreachable } from "./waterfallFetcher";
 import { fetchViaDecodo, isDecodoConfigured } from "./decodoApi";
+import { globalEnginePacer, ENGINE_PACE_MIN_INTERVAL_MS } from "../swarm/pluginBridgeAndPacer";
 import { searchRssFeeds } from "./rss-engine";
 import { searchTelegram } from "./social-engines";
 import {
@@ -185,7 +186,8 @@ async function searchHtmlEndpoint(url: string, source: string, maxResults: numbe
     // bing, searxng, ...) WAF out bots. Rendering the same search URL in a
     // headless browser via FlareSolverr sidesteps the challenge page. The result
     // HTML is fed through the same parser, so engines remain interchangeable.
-    if (flaresolverrUrl && flaresolverrUrl.trim() !== "" && !signal.aborted) {
+    // Skipped entirely when the run-start probe found the endpoint unreachable.
+    if (flaresolverrUrl && flaresolverrUrl.trim() !== "" && !signal.aborted && !isFlareSolverrKnownUnreachable()) {
       try {
         const fsHtml = await fetchWithWaterfall(url, signal, flaresolverrUrl);
         if (fsHtml) {
@@ -485,13 +487,21 @@ async function multiEngineSearchInner(
         switch (engine) {
           case "ddg": {
             const limiter = limiterFactory();
-            return searchDDG(query, perEngineLimit, "moderate", signal, limiter, timeRange, options.flaresolverrUrl);
+            // Serialize DDG across every worker: without this, 12 workers can
+            // fire the same-engine queries within milliseconds and trip the 202
+            // rate-limit page. The global pacer spaces them per ENGINE.
+            return globalEnginePacer.schedule("ddg", ENGINE_PACE_MIN_INTERVAL_MS, () =>
+              searchDDG(query, perEngineLimit, "moderate", signal, limiter, timeRange, options.flaresolverrUrl),
+            );
           }
           case "bing": return searchBing(query, perEngineLimit, signal, options.flaresolverrUrl);
           case "brave": return searchBrave(query, perEngineLimit, signal, options.flaresolverrUrl);
           case "google": return searchGoogle(query, perEngineLimit, signal, options.flaresolverrUrl);
           case "scholar": return searchGoogleScholar(query, perEngineLimit, signal, options.flaresolverrUrl);
-          case "searxng": return searchSearxng(query, perEngineLimit, signal, options.flaresolverrUrl);
+          case "searxng":
+            return globalEnginePacer.schedule("searxng", ENGINE_PACE_MIN_INTERVAL_MS, () =>
+              searchSearxng(query, perEngineLimit, signal, options.flaresolverrUrl),
+            );
           case "mojeek": return searchMojeek(query, perEngineLimit, signal, options.flaresolverrUrl);
           case "yandex": return searchYandex(query, perEngineLimit, signal, options.flaresolverrUrl);
           case "youtube": return searchYouTube(query, perEngineLimit, signal);

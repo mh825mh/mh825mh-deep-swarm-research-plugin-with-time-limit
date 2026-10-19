@@ -8,18 +8,30 @@ import {
   collectPredictionStream,
 } from "../utils/llm";
 import { boundEvidenceChunk } from "../utils/text";
+import { buildKvCachePinnedMessages } from "../swarm/singleflightAndSnippetGate";
 import {
   DepthProfile,
   AI_SYNTHESIS_TEMPERATURE,
   AI_SYNTHESIS_TIMEOUT_MS,
   CONTRADICTION_SOURCE_CHARS,
   CONTRADICTION_MAX_SOURCES,
-  SYSTEM_INSTRUCTIONS,
   THINKING_PROTOCOL,
 } from "../constants";
 
-/** Synthesis system prompt: base engine instructions plus the thinking rubric. */
-const SYNTHESIS_SYSTEM = `${SYSTEM_INSTRUCTIONS}\n\n${THINKING_PROTOCOL}`;
+/**
+ * KV-cache-pinned synthesis system message. Starts with the exact
+ * `STATIC_SWARM_SYSTEM_PREFIX` (+ the run's `[DOMAIN RUBRIC]`) the critic uses,
+ * so LM Studio keeps one warm prefix across the sequential critic → synthesis
+ * calls; only the trailing thinking protocol differs per phase.
+ */
+function synthesisSystemFor(skill?: SkillPack): string {
+  const pinned = buildKvCachePinnedMessages(
+    skill?.content,
+    "FINAL SYNTHESIS",
+    "",
+  ).system;
+  return `${pinned}\n\n${THINKING_PROTOCOL}`;
+}
 
 /** Narrative synthesis text plus the reasoning trace the model emitted. */
 export interface SynthesisResult {
@@ -82,15 +94,13 @@ export async function synthesiseReport(
 
   const evidenceBlock = prepareEvidenceLedger(evidence, budget.maxSynthesisInput);
 
-  const skillBlock = skill
-    ? `\nSKILL PACK APPLIED — "${skill.name}" v${skill.version} (auto-selected from topic domain tags). Follow its conventions for this topic:\n${skill.content}\n`
-    : "";
+  const synthesisSystem = synthesisSystemFor(skill);
 
   const prompt = `You are an expert research analyst. Write a comprehensive, well-structured narrative synthesis of these research findings.
 
 TOPIC: "${topic}"
 CLAIMS COVERED: ${coveredClaims.join(", ")}
-${skillBlock}
+
 EVIDENCE LEDGER (CRITIC-VERIFIED, PASS cards only — every card was graded on-topic and checked against the accepted ledger for contradictions):
  ${evidenceBlock}
 
@@ -129,7 +139,7 @@ SYNTHESIS:`;
 
     const messages = withThinkingDirective(
       [
-        { role: "system" as const, content: SYNTHESIS_SYSTEM },
+        { role: "system" as const, content: synthesisSystem },
         { role: "user" as const, content: prompt },
       ],
       { reasoningEffort: "medium" },

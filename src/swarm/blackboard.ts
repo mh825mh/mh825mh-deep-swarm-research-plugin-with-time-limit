@@ -19,6 +19,7 @@ export interface BlackboardSnapshot {
   readonly gradedCards: ReadonlyArray<GradedEvidenceCard>;
   readonly blockedUrls: ReadonlyArray<BlockedUrlEntry>;
   readonly timeLeftMs: number;
+  readonly memoryContext: string | null;
 }
 
 export interface Blackboard {
@@ -27,9 +28,12 @@ export interface Blackboard {
   readonly cards: ReadonlyArray<EvidenceCard>;
   readonly gradedCards: ReadonlyArray<GradedEvidenceCard>;
   readonly blockedUrls: ReadonlyArray<BlockedUrlEntry>;
+  /** Merged prior-run + sibling-plugin memory text for this topic (if any). */
+  readonly memoryContext: string | null;
   /** Milliseconds remaining until the crawl deadline (Infinity when unbounded). */
   timeLeft(): number;
   attachPlan(plan: ResearchPlan | null): void;
+  setMemoryContext(text: string | null): void;
   addGap(gap: string): void;
   mergeCards(cards: ReadonlyArray<EvidenceCard>): void;
   mergeGraded(graded: ReadonlyArray<GradedEvidenceCard>): void;
@@ -40,6 +44,7 @@ export type BlockedUrlsSource = () => ReadonlyArray<BlockedUrlEntry>;
 
 export class SwarmBlackboard implements Blackboard {
   private _plan: ResearchPlan | null = null;
+  private _memoryContext: string | null = null;
   private readonly _gaps: string[] = [];
   private readonly _cards: EvidenceCard[] = [];
   private readonly _graded: GradedEvidenceCard[] = [];
@@ -71,6 +76,10 @@ export class SwarmBlackboard implements Blackboard {
     return this.blockedSource();
   }
 
+  get memoryContext(): string | null {
+    return this._memoryContext;
+  }
+
   timeLeft(): number {
     if (!Number.isFinite(this.deadline)) return Infinity;
     return Math.max(0, this.deadline - Date.now());
@@ -78,6 +87,10 @@ export class SwarmBlackboard implements Blackboard {
 
   attachPlan(plan: ResearchPlan | null): void {
     this._plan = plan;
+  }
+
+  setMemoryContext(text: string | null): void {
+    this._memoryContext = text && text.trim().length > 0 ? text : null;
   }
 
   addGap(gap: string): void {
@@ -117,6 +130,7 @@ export class SwarmBlackboard implements Blackboard {
       gradedCards: [...this._graded],
       blockedUrls: this.blockedUrls,
       timeLeftMs: this.timeLeft(),
+      memoryContext: this._memoryContext,
     };
   }
 }
