@@ -1,7 +1,7 @@
 // src/net/search-engines.ts
 import type { SearchHit } from "../types";
 import { DdgRateLimiter, searchDDG } from "./ddg";
-import { buildBrowserHeaders, fetchPage } from "./http";
+import { buildBrowserHeaders, fetchLocalAllowed, fetchPage } from "./http";
 import { fetchWithWaterfall, isFlareSolverrKnownUnreachable } from "./waterfallFetcher";
 import { fetchViaDecodo, isDecodoConfigured } from "./decodoApi";
 import { globalEnginePacer, ENGINE_PACE_MIN_INTERVAL_MS } from "../swarm/pluginBridgeAndPacer";
@@ -43,6 +43,9 @@ export interface SearchEngineOptions {
   readonly rssFeedUrls?: ReadonlyArray<string>;
   readonly telegramChannels?: ReadonlyArray<string>;
   readonly flaresolverrUrl?: string;
+
+  /** Local SearXNG base URL (e.g. http://127.0.0.1:8080). Blank = public only. */
+  readonly searxngUrl?: string;
 }
 
 export type LimiterFactory = () => DdgRateLimiter;
@@ -216,13 +219,160 @@ async function searchGoogleScholar(query: string, maxResults: number, signal: Ab
   return searchHtmlEndpoint(`https://scholar.google.com/scholar?q=${encodeURIComponent(query)}`, "scholar", maxResults, signal, flaresolverrUrl);
 }
 
-async function searchSearxng(query: string, maxResults: number, signal: AbortSignal, flaresolverrUrl?: string): Promise<ReadonlyArray<SearchHit>> {
-  const endpoints = [
-    `https://searx.be/search?q=${encodeURIComponent(query)}&format=html`,
-  ];
-  for (const endpoint of endpoints) {
-    const hits = await searchHtmlEndpoint(endpoint, "searxng", maxResults, signal, flaresolverrUrl);
+/** Default base URL of the local SearXNG instance (matches the config default). */
+export const DEFAULT_SEARXNG_LOCAL_URL = "http://127.0.0.1:8080";
+const PUBLIC_SEARXNG_URL = "https://searx.be";
+
+export function normalizeSearxBase(base: string): string {
+  return base.trim().replace(/\/+$/, "").replace(/\/search$/, "");
+}
+
+/**
+ * Ordered SearXNG endpoints for a query: local first (when configured and not
+ * known-dead), then the public instance. The local tier's URLs are marked so
+ * the caller can pass the matching SSRF allowance.
+ */
+export function searxEndpointsFor(
+  rawBase: string,
+  query: string,
+  maxResults: number,
+): ReadonlyArray<{ url: string; local: boolean }> {
+  const base = normalizeSearxBase(rawBase ?? "");
+  const q = encodeURIComponent(query);
+  const endpoints: { url: string; local: boolean }[] = [];
+  if (base) {
+    endpoints.push({
+      url: `${base}/search?q=${q}&format=html`,
+      local: true,
+    });
+  }
+  endpoints.push({ url: `${PUBLIC_SEARXNG_URL}/search?q=${q}&format=html`, local: false });
+  return endpoints;
+}
+
+interface SearxLocalState {
+  configured: boolean;
+  probed: boolean;
+  reachable: boolean | null;
+  probeError: string | null;
+}
+
+let searxLocal: SearxLocalState = { configured: false, probed: false, reachable: null, probeError: null };
+
+export function getSearxLocalStats(): Readonly<SearxLocalState> {
+  return { ...searxLocal };
+}
+
+export function isSearxLocalKnownUnavailable(): boolean {
+  return searxLocal.probed && searxLocal.reachable === false;
+}
+
+export function resetSearxLocalStats(): void {
+  searxLocal = { configured: false, probed: false, reachable: null, probeError: null };
+}
+
+function setSearxLocal(reachable: boolean, probeError: string | null): void {
+  searxLocal = {
+    ...searxLocal,
+    probed: true,
+    reachable,
+    probeError: reachable ? null : probeError,
+  };
+}
+
+/**
+ * Run-start connectivity probe for the configured local SearXNG instance.
+ * Never throws; on failure the local tier is marked dead for the run so
+ * searches fall straight through to the public instance.
+ */
+export async function probeSearxLocal(rawBase: string, signal?: AbortSignal): Promise<void> {
+  const base = normalizeSearxBase(rawBase ?? "");
+  searxLocal = { configured: Boolean(base), probed: false, reachable: null, probeError: null };
+  if (!base) {
+    setSearxLocal(false, "empty URL");
+    return;
+  }
+
+  const headers = buildBrowserHeaders(base);
+  // Prefer the HTML endpoint first: it works even when trainers disable the
+  // JSON API. The instance's bot-limiter 403s are treated as "reachable but
+  // refuses us", which still means the endpoint is up.
+  for (const url of [`${base}/search?q=probe&format=html`, `${base}/`]) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 5000);
+    try {
+      const res = await fetch(url, { signal: ctrl.signal, headers, redirect: "follow" });
+      if (res.ok || res.status === 403 || res.status === 429) {
+        setSearxLocal(true, null);
+        return;
+      }
+      setSearxLocal(false, `HTTP ${res.status} from ${url}`);
+      if (res.status !== 404) return;
+    } catch (error: unknown) {
+      if (signal?.aborted) {
+        setSearxLocal(false, "probing aborted");
+        return;
+      }
+      setSearxLocal(
+        false,
+        error instanceof Error ? error.message : String(error),
+      );
+      // Any connection failure on the first URL is definitive for TCP-refused;
+      // try the root second for the 404-free fallback case.
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+}
+
+/** Local SearXNG search: fast, direct fetch via the engine queue. No retry /
+ * backoff / Wayback tiers — a dead local instance fails fast so the caller can
+ * fall through to the public instance. */
+async function searchSearxLocal(url: string, maxResults: number, signal: AbortSignal, allowBase: string): Promise<ReadonlyArray<SearchHit>> {
+  if (signal.aborted) throw new DOMException("Aborted", "AbortError");
+  const queue = engineQueues["searxng"] || new EngineQueue(4000);
+  return queue.run(async () => {
+    try {
+      const response = await fetchLocalAllowed(url, signal, [allowBase]);
+      return parseSearchLinks(response.html, "searxng", maxResults);
+    } catch (error: unknown) {
+      if (error instanceof DOMException && error.name === "AbortError") throw error;
+      const msg = error instanceof Error ? error.message : String(error);
+      // Mark the local tier dead for the rest of the run (the pre-flight probe
+      // normally catches this, but an instance can die mid-run).
+      setSearxLocal(false, msg);
+      return [];
+    }
+  });
+}
+
+async function searchSearxng(query: string, maxResults: number, signal: AbortSignal, flaresolverrUrl?: string, searxngUrl?: string): Promise<ReadonlyArray<SearchHit>> {
+  let warnedLocalUnavailable = false;
+  for (const { url, local } of searxEndpointsFor(searxngUrl ?? "", query, maxResults)) {
+    if (local && isSearxLocalKnownUnavailable()) {
+      if (!warnedLocalUnavailable) {
+        warnedLocalUnavailable = true;
+        console.warn(
+          `[searxng] Local instance (${normalizeSearxBase(searxngUrl ?? "")}) unavailable` +
+            ` (${getSearxLocalStats().probeError ?? "no response"}) — falling back to public ${PUBLIC_SEARXNG_URL}.`,
+        );
+      }
+      continue;
+    }
+    const allow = local ? normalizeSearxBase(searxngUrl ?? DEFAULT_SEARXNG_LOCAL_URL) : undefined;
+    const hits = local
+      ? await searchSearxLocal(url, maxResults, signal, allow!)
+      : await searchHtmlEndpoint(url, "searxng", maxResults, signal, flaresolverrUrl);
     if (hits.length > 0) return hits;
+    if (local && !isSearxLocalKnownUnavailable()) {
+      // Local instance is up but returned no parseable results — fall through
+      // to the public instance for this query without permanently disabling
+      // the local tier.
+      console.warn(
+        `[searxng] Local instance returned no results — falling back to public ${PUBLIC_SEARXNG_URL}.`,
+      );
+    }
+    warnedLocalUnavailable = true;
   }
   return [];
 }
@@ -500,7 +650,7 @@ async function multiEngineSearchInner(
           case "scholar": return searchGoogleScholar(query, perEngineLimit, signal, options.flaresolverrUrl);
           case "searxng":
             return globalEnginePacer.schedule("searxng", ENGINE_PACE_MIN_INTERVAL_MS, () =>
-              searchSearxng(query, perEngineLimit, signal, options.flaresolverrUrl),
+              searchSearxng(query, perEngineLimit, signal, options.flaresolverrUrl, options.searxngUrl),
             );
           case "mojeek": return searchMojeek(query, perEngineLimit, signal, options.flaresolverrUrl);
           case "yandex": return searchYandex(query, perEngineLimit, signal, options.flaresolverrUrl);

@@ -308,6 +308,7 @@ export interface SwarmTask {
   readonly braveApiKey?: string;
   readonly decodoApiToken?: string;
   readonly flaresolverrUrl?: string;
+  readonly searxngUrl?: string;
   readonly rssFeedUrls?: ReadonlyArray<string>;
   readonly telegramChannels?: ReadonlyArray<string>;
   /** When false, no persistent heuristic learning is recorded. Default: true. */
@@ -499,6 +500,12 @@ export interface ResearchConfig {
   readonly engineSelectionMode?: "adaptive" | "benchmark" | "priority";
   readonly cacheDuration?: string;
   readonly flaresolverrUrl?: string;
+
+  /**
+   * Local SearXNG instance base URL tried before the public instance.
+   * Blank/undefined = public instance only.
+   */
+  readonly searxngUrl?: string;
   readonly crossrefMailto?: string;
   readonly enableYouTube?: boolean;
   readonly enableAcademicAPIs?: boolean;

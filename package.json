@@ -1,6 +1,6 @@
 {
   "name": "lms-plugin-deep-swarm-research",
-  "version": "5.10.0",
+  "version": "5.11.0",
   "description": "Deep Swarm Research Plugin for LM Studio",
   "main": "dist/index.js",
   "scripts": {

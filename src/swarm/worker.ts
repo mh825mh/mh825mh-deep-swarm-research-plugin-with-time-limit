@@ -393,7 +393,7 @@ export async function runWorker(
                 Math.min(task.searchResultsPerQuery, EXTRA_ENGINE_MAX_RESULTS) * Math.max(1, usableEngines.length),
                 usableEngines,
                 signal, () => limiter, task.timeRange ?? "all",
-                { serperApiKey: (task as any).serperApiKey, braveApiKey: (task as any).braveApiKey, rssFeedUrls: (task as any).rssFeedUrls, telegramChannels: (task as any).telegramChannels, flaresolverrUrl: (task as any).flaresolverrUrl }
+                { serperApiKey: (task as any).serperApiKey, braveApiKey: (task as any).braveApiKey, rssFeedUrls: (task as any).rssFeedUrls, telegramChannels: (task as any).telegramChannels, flaresolverrUrl: (task as any).flaresolverrUrl, searxngUrl: (task as any).searxngUrl }
               );
               metrics.extraEngineHits += mutExtraHits.length;
               for (const h of mutExtraHits) allHits.push({ ...h, query: bestMutation.query });
@@ -452,7 +452,7 @@ export async function runWorker(
             Math.min(task.searchResultsPerQuery, EXTRA_ENGINE_MAX_RESULTS) * Math.max(1, usableEngines.length),
             usableEngines,
             signal, () => limiter, task.timeRange ?? "all",
-            { serperApiKey: (task as any).serperApiKey, braveApiKey: (task as any).braveApiKey, rssFeedUrls: (task as any).rssFeedUrls, telegramChannels: (task as any).telegramChannels, flaresolverrUrl: (task as any).flaresolverrUrl }
+            { serperApiKey: (task as any).serperApiKey, braveApiKey: (task as any).braveApiKey, rssFeedUrls: (task as any).rssFeedUrls, telegramChannels: (task as any).telegramChannels, flaresolverrUrl: (task as any).flaresolverrUrl, searxngUrl: (task as any).searxngUrl }
           );
           metrics.extraEngineHits += extraHits.length;
           for (const h of extraHits) allHits.push({ ...h, query });

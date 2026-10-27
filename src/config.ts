@@ -27,6 +27,16 @@ export const globalConfigSchematics = createConfigSchematics()
     },
     "",
   )
+  .field(
+    "searxngUrl",
+    "string",
+    {
+      displayName: "SearXNG URL",
+      subtitle:
+        "Optional: Local SearXNG instance (e.g. http://127.0.0.1:8080). Defaults to a local endpoint; if unreachable the engine warns once and falls back to the public instance. Blank = public only.",
+    },
+    "http://127.0.0.1:8080",
+  )
   .build();
 
 /**

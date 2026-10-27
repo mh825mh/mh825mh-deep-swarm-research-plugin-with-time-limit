@@ -71,6 +71,48 @@ export interface FetchOptions {
   headers?: Record<string, string>;
 }
 
+export function isSsrfAllowed(urlStr: string, allowUrls?: ReadonlyArray<string>): boolean {
+  const allow = allowUrls ?? [];
+  if (allow.length === 0) return false;
+  try {
+    const origin = new URL(urlStr).origin;
+    return allow.some((a) => {
+      try { return new URL(a).origin === origin; } catch { return false; }
+    });
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Direct fetch for user-configured local infrastructure (allowed private URLs).
+ * Unlike fetchPage there is no retry/backoff and no Wayback fallback: a local
+ * endpoint that is down should fail fast so the caller can switch tiers.
+ */
+export async function fetchLocalAllowed(
+  url: string,
+  signal: AbortSignal,
+  allowUrls: ReadonlyArray<string>,
+): Promise<FetchResult> {
+  if (isPrivateUrl(url) && !isSsrfAllowed(url, allowUrls)) {
+    throw new Error("SSRF Guard: Blocked internal URL");
+  }
+  if (signal.aborted) throw new DOMException("Aborted", "AbortError");
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  try {
+    const res = await fetch(url, {
+      signal: controller.signal,
+      headers: buildBrowserHeaders(url),
+      redirect: "follow",
+    });
+    const contentType = res.headers.get("content-type") || "";
+    return { html: await res.text(), finalUrl: res.url || url, contentType, statusCode: res.status };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export async function fetchPage(
   url: string, 
   signal: AbortSignal, 

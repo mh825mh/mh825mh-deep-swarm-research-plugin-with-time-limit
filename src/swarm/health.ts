@@ -1,6 +1,7 @@
 // src/swarm/health.ts
 
 import { getFsStats } from "../net/waterfallFetcher";
+import { getSearxLocalStats } from "../net/search-engines";
 import { getDecodoStats } from "../net/decodoApi";
 
 export type EngineState = "HEALTHY" | "DEGRADED" | "TEMPORARILY_UNHEALTHY" | "DISABLED";
@@ -166,6 +167,18 @@ SEARXNG HEALTH
 - State: ${this.searxng.state}
 - Searches attempted: ${this.searxng.searchesAttempted}
 - Valid results: ${this.searxng.validResults}
+
+SEARXNG LOCAL INSTANCE
+${(() => {
+  const sx = getSearxLocalStats();
+  if (!sx.configured) return "- Not configured (public instance only)";
+  const state = sx.reachable === null ? "NOT PROBED" : sx.reachable ? "REACHABLE" : "UNREACHABLE (public fallback active)";
+  return [
+    `- Configured: YES`,
+    `- State: ${state}`,
+    sx.probeError ? `- Probe error: ${sx.probeError}` : null,
+  ].filter(Boolean).join("\\n");
+})()}
 
 OTHER ENGINES HEALTH
 ${Object.entries(this.otherEngines).map(([name, e]) => `- ${name}: ${e.state} (${e.searchesAttempted} attempts, ${e.validResults} valid, cooldown ${e.cooldownExpiry ? new Date(e.cooldownExpiry).toISOString() : "None"})`).join("\n") || "- No extra engines probed yet"}

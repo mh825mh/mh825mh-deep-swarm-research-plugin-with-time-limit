@@ -80,6 +80,7 @@ function readConfig(ctl: any) {
     contextIsolation: "strict",
     llmCallMode: "standard",
     flaresolverrUrl: "",
+    searxngUrl: "",
     crossrefMailto: "",
     rssFeedUrls: [] as string[],
     telegramChannels: [] as string[],
@@ -157,6 +158,7 @@ function readConfig(ctl: any) {
         globalRaw = {
           decodoApiToken: tryGet(gParsed, "decodoApiToken"),
           flaresolverrUrl: tryGet(gParsed, "flaresolverrUrl"),
+          searxngUrl: tryGet(gParsed, "searxngUrl"),
         };
       }
     } catch {
@@ -277,6 +279,13 @@ function readConfig(ctl: any) {
           ? globalRaw.flaresolverrUrl.trim()
           : typeof cfg.flaresolverrUrl === "string" && cfg.flaresolverrUrl.trim()
             ? cfg.flaresolverrUrl.trim()
+            : "",
+
+      searxngUrl:
+        typeof globalRaw.searxngUrl === "string" && globalRaw.searxngUrl.trim()
+          ? globalRaw.searxngUrl.trim()
+          : typeof cfg.searxngUrl === "string" && cfg.searxngUrl.trim()
+            ? cfg.searxngUrl.trim()
             : "",
 
       crossrefMailto: fileKeys.crossrefMailto || "",
@@ -438,6 +447,7 @@ const result = await runDeepResearch(
     contextIsolation: ui.contextIsolation,
     llmCallMode: ui.llmCallMode,
     flaresolverrUrl: ui.flaresolverrUrl,
+    searxngUrl: ui.searxngUrl,
     crossrefMailto: ui.crossrefMailto,
     rssFeedUrls: ui.rssFeedUrls,
     telegramChannels: ui.telegramChannels,

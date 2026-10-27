@@ -9,6 +9,16 @@ All notable changes to `lms-plugin-deep-swarm-research`, newest first. See `READ
 Latency, zero-source resilience, and KV-cache efficiency for local Qwen-class
 models.
 
+* **Local-first SearXNG (`searxngUrl` global setting):** the SearXNG engine now
+  defaults to a local instance (`http://127.0.0.1:8080`), probed at run start.
+  When the local endpoint is unreachable the run logs a `[SEARXNG] unreachable`
+  warning once and transparently falls back to the public `https://searx.be`
+  instance for that whole run; a local instance that empties mid-run degrades
+  the same way without retry failures. The local tier fetches fail fast (no
+  retry/backoff/Wayback tiers) and are allowed through the SSRF guard only for
+  the user-configured origin — every other URL stays guarded. Blank the setting
+  to disable the local tier entirely.
+
 * **Qwen 3.8 fast-call mode (`optimizeForQwen38`):** the gatekeeper, critic, and
   query-mutation micro-calls now prefill an empty `<think>\n</think>\n` block and
   append `/no_think`, so a one-word YES/NO or a short verdict can't be truncated

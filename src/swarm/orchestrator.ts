@@ -43,6 +43,7 @@ import { persistRunMemory } from "../memory/persist";
 import { retrieveMemoryForTopic } from "../memory/retrieve";
 import { querySiblingPluginCaches, withHardTimeout } from "./pluginBridgeAndPacer";
 import { probeFlareSolverr, resetFsStats } from "../net/waterfallFetcher";
+import { getSearxLocalStats, probeSearxLocal, resetSearxLocalStats } from "../net/search-engines";
 import { resetDecodoSession, setDecodoToken, getDecodoStats } from "../net/decodoApi";
 import fs from "node:fs";
 import path from "node:path";
@@ -354,6 +355,7 @@ function buildTaskBase(
   | "braveApiKey"
   | "enableYouTube"
   | "flaresolverrUrl"
+  | "searxngUrl"
   | "rssFeedUrls"
   | "telegramChannels"
   | "enableAdaptiveLearning"
@@ -395,6 +397,7 @@ function buildTaskBase(
     braveApiKey: cfg.braveApiKey,
     enableYouTube: cfg.enableYouTube,
     flaresolverrUrl: cfg.flaresolverrUrl,
+    searxngUrl: cfg.searxngUrl,
     rssFeedUrls: cfg.rssFeedUrls,
     telegramChannels: cfg.telegramChannels,
     enableAdaptiveLearning: cfg.enableAdaptiveLearning !== false,
@@ -667,6 +670,26 @@ export async function runSwarm(
   }
 
   // ==========================================
+  // LOCAL SEARXNG PRE-FLIGHT PROBE
+  // ==========================================
+  {
+    resetSearxLocalStats();
+    const sxUrl = cfg.searxngUrl?.trim() ?? "";
+    if (sxUrl) {
+      fileStatus(`[SEARXNG] Probing local instance ${sxUrl} ...`);
+      await probeSearxLocal(sxUrl, llmManager.signal);
+      const sx = getSearxLocalStats();
+      if (sx.reachable) {
+        fileStatus(`[SEARXNG] Local instance reachable — searches prefer the local endpoint.`);
+      } else {
+        fileWarn(`[SEARXNG] Local instance unreachable (${sx.probeError ?? "no response"}) — falling back to public https://searx.be.`);
+      }
+    } else {
+      fileStatus(`[SEARXNG] No local URL configured — public instance only.`);
+    }
+  }
+
+  // ==========================================
   // DECODO PRE-FLIGHT
   // ==========================================
   {
@@ -681,15 +704,39 @@ export async function runSwarm(
   fileStatus(`\n🚀 DEEP RESEARCH SWARM LAUNCHED (Strict Priority Mode)\n`);
   fileStatus(`[RUN CONTROL] Budget: ${llmManager.budget.maxGlobalCalls} calls | Timeout: ${llmManager.budget.maxRuntimeMs / 60000}m | Isolation: ${llmManager.isolationMode}`);
 
-  const plan = await buildQueryPlan(
-    cfg.topic,
-    cfg.enableAdaptiveLearning !== false
-      ? [...cfg.focusAreas, ...getLearnedHints().all().slice(0, 5)]
-      : cfg.focusAreas,
-    cfg.enableAIPlanning,
-    fileStatus,
-    profile,
-  );
+  let plan: Awaited<ReturnType<typeof buildQueryPlan>>;
+  try {
+    fileStatus("AI task decomposition - analysing topic for specialised workers...");
+    plan = await buildQueryPlan(
+      cfg.topic,
+      cfg.enableAdaptiveLearning !== false
+        ? [...cfg.focusAreas, ...getLearnedHints().all().slice(0, 5)]
+        : cfg.focusAreas,
+      cfg.enableAIPlanning,
+      fileStatus,
+      profile,
+    );
+    if (!plan.usedAI) {
+      fileStatus("AI unavailable, using dimension-based query planning");
+    }
+  } catch (err: any) {
+    const msg = err?.message ?? String(err);
+    fileWarn(`[AI PLANNER FAILED] Reason: ${msg}`);
+    if (err?.stack) {
+      const firstLines = err.stack.split("\n").slice(0, 3).join(" -> ");
+      fileStatus(`[DEBUG] [AI STACK]: ${firstLines}`);
+    }
+    // Fallback to deterministic dimension-based planning
+    plan = await buildQueryPlan(
+      cfg.topic,
+      cfg.enableAdaptiveLearning !== false
+        ? [...cfg.focusAreas, ...getLearnedHints().all().slice(0, 5)]
+        : cfg.focusAreas,
+      false,
+      fileStatus,
+      profile,
+    );
+  }
   const memoryContext = retrieveMemoryForTopic({
   topic: cfg.topic,
   topicKeywords: plan.topicKeywords,
