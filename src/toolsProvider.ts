@@ -31,6 +31,7 @@ import {
 } from "./constants";
 import { sleep } from "./net/http";
 import { runDeepResearch } from "./researcher";
+import { setLlmClient } from "./utils/llm";
 import { loadUserKeys, keysFilePath } from "./config/keys";
 import { configSchematics, globalConfigSchematics } from "./config";
 import { setDecodoToken } from "./net/decodoApi";
@@ -358,6 +359,10 @@ function defaultSearchEngines(cfg: ReturnType<typeof readConfig>): SearchEngine[
 }
 
 export async function toolsProvider(ctl: any) {
+  // Reuse the authenticated controller client. Creating a bare
+  // `new LMStudioClient()` inside a plugin throws the SDK context error.
+  setLlmClient(ctl?.client ?? null);
+
   const deepResearchTool = tool({
     name: "DeepResearch",
     description: "Runs a deep research swarm on the given topic.",

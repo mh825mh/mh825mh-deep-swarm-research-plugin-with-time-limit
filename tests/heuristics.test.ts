@@ -51,6 +51,18 @@ describe("passesHeuristicFilter", () => {
     expect(result.reason).toBeUndefined();
   });
 
+  it("passes a reference card at ~11% overlap instead of auto-rejecting it", () => {
+    const result = passesHeuristicFilter({
+      url: "https://en.wikipedia.org/wiki/Church_Fathers",
+      title: "Church Fathers",
+      text: padded("orthodox"),
+      query:
+        "orthodox church fathers theology deification theosis tradition patristic writings",
+      sourceTier: "reference",
+    });
+    expect(result.pass).toBe(true);
+  });
+
   it("passes when the query has no distinctive keywords", () => {
     const result = passesHeuristicFilter({
       url: "https://example.com",

@@ -11,6 +11,8 @@ import {
   buildKvCachePinnedMessages,
 } from "../src/swarm/singleflightAndSnippetGate";
 import { seedFromTierZeroJsonApis } from "../src/net/tierZeroJsonSeeder";
+import { buildQueryPlan } from "../src/planning/planner";
+import { getDepthProfile } from "../src/constants";
 
 describe("optimizeForQwen38", () => {
   it("suppresses reasoning on micro-calls with prefill + /no_think", () => {
@@ -162,6 +164,45 @@ describe("selectAdaptiveFallbackDimensions", () => {
     const biz = selectAdaptiveFallbackDimensions("acme ltd market pricing");
     expect(biz.map((d) => d.id)).toContain("dim_economics");
   });
+
+  it("keeps long-topic fallback queries short and free of years/operators", () => {
+    const topic =
+      "What are the core mechanisms, evidence, and primary sources of the " +
+      "Orthodox Church Fathers' theology of deification (theosis) according to tradition?";
+    const dims = selectAdaptiveFallbackDimensions(topic, 4);
+    const queries = dims.flatMap((d) => d.queries);
+
+    expect(queries.length).toBeGreaterThan(0);
+    for (const q of queries) {
+      expect(q.split(/\s+/).length).toBeLessThanOrEqual(10);
+      expect(q).not.toMatch(/\bsite:/);
+      expect(q).not.toMatch(/\b2025\b|\b2026\b/);
+      expect(q.toLowerCase()).toContain("orthodox");
+    }
+  });
+});
+
+describe("deterministic planner query hygiene", () => {
+  it("caps fallback queries at 10 keywords without years or site operators", async () => {
+    const topic =
+      "What are the core mechanisms, evidence, and primary sources of the " +
+      "Orthodox Church Fathers' theology of deification (theosis) according to tradition?";
+    const plan = await buildQueryPlan(
+      topic,
+      [],
+      false,
+      () => {},
+      getDepthProfile("standard"),
+    );
+    const queries = Object.values(plan.queriesByRole).flatMap((qs) => qs ?? []);
+
+    expect(queries.length).toBeGreaterThan(0);
+    for (const q of queries) {
+      expect(q.split(/\s+/).filter(Boolean).length).toBeLessThanOrEqual(10);
+      expect(q).not.toMatch(/\bsite:/);
+      expect(q).not.toMatch(/\b2025\b|\b2026\b/);
+    }
+  });
 });
 
 describe("buildKvCachePinnedMessages", () => {
@@ -192,8 +233,10 @@ describe("seedFromTierZeroJsonApis", () => {
   });
 
   it("parses OpenAlex + Wikipedia REST hits into verified seed cards", async () => {
+    const requestedUrls: string[] = [];
     globalThis.fetch = vi.fn(async (url: string | URL) => {
       const u = String(url);
+      requestedUrls.push(u);
       if (u.includes("api.openalex.org")) {
         return new Response(
           JSON.stringify({
@@ -244,6 +287,30 @@ describe("seedFromTierZeroJsonApis", () => {
     const wiki = cards.find((c) => c.engine === "wikipedia");
     expect(wiki?.url).toBe("https://en.wikipedia.org/wiki/Reincarnation");
     expect(wiki?.sourceTier).toBe("REFERENCE");
+  });
+
+  it("shortens a long research prompt to 3-4 core keywords before querying", async () => {
+    const requested: string[] = [];
+    globalThis.fetch = vi.fn(async (url: string | URL) => {
+      requested.push(String(url));
+      return new Response("{}", { status: 200 });
+    }) as unknown as typeof fetch;
+
+    const longTopic =
+      "What are the core mechanisms, evidence, and primary sources of the " +
+      "Orthodox Church Fathers' theology of deification (theosis) according to tradition?";
+    await seedFromTierZeroJsonApis(longTopic);
+
+    const queryUrls = requested.filter((u) => u.includes("search=") || u.includes("srsearch="));
+    expect(queryUrls.length).toBeGreaterThan(0);
+    for (const raw of queryUrls) {
+      const url = new URL(raw);
+      const q = decodeURIComponent(
+        url.searchParams.get("search") ?? url.searchParams.get("srsearch") ?? "",
+      );
+      expect(q.split(/\s+/).filter(Boolean).length).toBeLessThanOrEqual(4);
+      expect(q).not.toContain("site:");
+    }
   });
 
   it("returns [] (never throws) when every JSON API fails", async () => {

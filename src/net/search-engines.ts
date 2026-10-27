@@ -267,6 +267,27 @@ export function isSearxLocalKnownUnavailable(): boolean {
   return searxLocal.probed && searxLocal.reachable === false;
 }
 
+/** True only after a successful run-start probe of the configured local URL. */
+export function isSearxLocalReachable(): boolean {
+  return searxLocal.probed && searxLocal.reachable === true;
+}
+
+/**
+ * Promote the local SearXNG engine to index 0 when it is reachable, so the
+ * worker waterfall queries the local instance before DDG. When it is not
+ * reachable the configured order is preserved untouched.
+ */
+export function prioritizeSearxng(
+  engines: ReadonlyArray<string>,
+  localReachable: boolean,
+): string[] {
+  const deduped = Array.from(new Set(engines.filter((engine) => Boolean(engine))));
+  // Promote only when SearXNG is already part of this engine set. Adding it
+  // unconditionally let the DIRECT/API layers re-run SearXNG on every query.
+  if (!localReachable || !deduped.includes("searxng")) return deduped;
+  return ["searxng", ...deduped.filter((engine) => engine !== "searxng")];
+}
+
 export function resetSearxLocalStats(): void {
   searxLocal = { configured: false, probed: false, reachable: null, probeError: null };
 }

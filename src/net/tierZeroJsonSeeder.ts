@@ -5,6 +5,8 @@
 // cards without ever risking a CAPTCHA or a DDG 202 rate limit. The seeded
 // cards are promoted straight to evidence cards, so the 2-minute stall watchdog
 // can never trip during the first crawl layers.
+import { buildCoreTopicQuery } from "../utils/topicQuery";
+
 export interface TierZeroSeedCard {
   url: string;
   title: string;
@@ -22,7 +24,10 @@ export async function seedFromTierZeroJsonApis(
   crossrefMailto?: string,
   log?: (msg: string) => void,
 ): Promise<TierZeroSeedCard[]> {
-  const cleanTopic = topic.replace(/[^\w\s-]/g, " ").trim();
+  // OpenAlex/Wikipedia have poor recall for a 25+ word prompt. Keep only the
+  // 3-4 core entity keywords (the orchestrator also passes a pre-shortened
+  // query; this is defence-in-depth for every caller).
+  const cleanTopic = buildCoreTopicQuery(topic, 4);
   const encoded = encodeURIComponent(cleanTopic);
   const headers: Record<string, string> = {
     "User-Agent": `DeepSwarmResearch/5.9.1 (mailto:${crossrefMailto || "local@saverapps.uk"})`,

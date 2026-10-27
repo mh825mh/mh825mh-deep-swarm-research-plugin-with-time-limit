@@ -207,6 +207,26 @@ describe("buildRetryQueries", () => {
     expect(queries[0]).toContain("controlled data");
     expect(new Set(queries).size).toBe(queries.length);
   });
+
+  it("strips evidence-card metadata before building a retry query", () => {
+    const queries = buildRetryQueries(
+      [
+        {
+          relevantClaim:
+            "[OpenAlex Peer-Reviewed Work] Title: Patristic Theology Year: 2022 " +
+            "Abstract: In this paper the authors examine deification in the Church Fathers.",
+        },
+      ],
+      "orthodox church fathers",
+      3,
+    );
+
+    expect(queries).toHaveLength(1);
+    expect(queries[0]).not.toContain("[");
+    expect(queries[0]).not.toContain("Abstract");
+    expect(queries[0]).not.toContain("Title:");
+    expect(queries[0].split(/\s+/).length).toBeLessThanOrEqual(10);
+  });
 });
 
 describe("parseVerdicts (item 4 structured output)", () => {

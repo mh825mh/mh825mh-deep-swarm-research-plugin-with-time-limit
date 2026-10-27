@@ -1,11 +1,11 @@
 // src/synthesis/ai.ts
-import { LMStudioClient } from "@lmstudio/sdk";
 import { ReportSource, ContradictionEntry, StatusFn, EvidenceCard, GradedEvidenceCard, ContextBudget, SkillPack } from "../types";
 import { logLlmDiagnostics, estimateTokens, preflightSynthesis } from "../utils/tokens";
 import {
   buildPredictionOptions,
   withThinkingDirective,
   collectPredictionStream,
+  getLlmClient,
 } from "../utils/llm";
 import { boundEvidenceChunk } from "../utils/text";
 import { buildKvCachePinnedMessages } from "../swarm/singleflightAndSnippetGate";
@@ -128,7 +128,7 @@ SYNTHESIS:`;
   logLlmDiagnostics("synthesiseReport", prompt);
 
   try {
-    const client = new LMStudioClient();
+    const client = getLlmClient();
     const models = await Promise.race<Awaited<ReturnType<typeof client.llm.listLoaded>>>([
       client.llm.listLoaded(),
       new Promise<never>((_, reject) => setTimeout(() => reject(new Error("timeout")), AI_SYNTHESIS_TIMEOUT_MS)),
@@ -251,7 +251,7 @@ Max ${maxContradictions} contradictions.
 OUTPUT:`;
 
   try {
-    const client = new LMStudioClient();
+    const client = getLlmClient();
     const models = await client.llm.listLoaded();
     if (!models || models.length === 0) return [];
     const model = await client.llm.model(models[0].identifier);

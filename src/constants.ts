@@ -218,8 +218,14 @@ export const EXTRA_ENGINE_MAX_RESULTS = 24;
 export const EVIDENCE_CHUNK_MAX_CHARS = 6_000;
 /** Minimum excerpt length before an evidence card is worth grading. */
 export const HEURISTIC_MIN_TEXT_LEN = 180;
-/** Minimum query-keyword overlap ratio a snippet must reach to be graded. */
-export const HEURISTIC_MIN_KEYWORD_OVERLAP = 0.2;
+/**
+ * Minimum query-keyword overlap ratio a snippet must reach to be graded.
+ * Long research prompts dilute overlap across many terms; 0.08 lets a valid
+ * 11%-overlap passage reach the LLM instead of being auto-rejected.
+ */
+export const HEURISTIC_MIN_KEYWORD_OVERLAP = 0.08;
+/** Reference/encyclopedia/patristic sources often use different vocabulary. */
+export const HEURISTIC_MIN_KEYWORD_OVERLAP_REFERENCE = 0.05;
 /** Lexical score at/above which a card is "high tier" (retry-worthy). */
 export const HEURISTIC_HIGH_TIER_SCORE = 0.55;
 /** Lexical score at/above which a card is "medium tier". */

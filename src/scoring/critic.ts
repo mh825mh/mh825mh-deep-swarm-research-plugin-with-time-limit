@@ -30,6 +30,7 @@ import { extractQwenJson } from "../utils/qwen-parser";
 import { boundEvidenceChunk } from "../utils/text";
 import { optimizeForQwen38 } from "../utils/qwenOptimizer";
 import { buildKvCachePinnedMessages } from "../swarm/singleflightAndSnippetGate";
+import { sanitizeSearchQuery } from "../net/queryCache";
 import { lexicalScore, passesHeuristicFilter, LexicalTier } from "./heuristics";
 import {
   CRITIC_CARDS_PER_BATCH,
@@ -46,8 +47,22 @@ import {
 } from "../planning/schemas";
 
 const CRITIC_WORKER_ID = "critic";
-const ON_TOPIC_OVERLAP_THRESHOLD = 0.4;
+/**
+ * Long multi-term topics dilute overlap. General sources use 10%; reference /
+ * encyclopedia / academic / government cards use 8% so patristic and undated
+ * reference material is not auto-marked OFF-TOPIC when no LLM is available.
+ */
+const ON_TOPIC_OVERLAP_THRESHOLD = 0.1;
+const ON_TOPIC_OVERLAP_THRESHOLD_REFERENCE = 0.08;
 const STALE_YEARS = 4;
+
+function onTopicThreshold(card: EvidenceCard): number {
+  return card.sourceTier === "reference" ||
+    card.sourceTier === "academic" ||
+    card.sourceTier === "government"
+    ? ON_TOPIC_OVERLAP_THRESHOLD_REFERENCE
+    : ON_TOPIC_OVERLAP_THRESHOLD;
+}
 
 /**
  * Static critic identity/rules. Kept in the SYSTEM message (via the KV-cache
@@ -160,7 +175,7 @@ function preGrade(
   const overlap = keywordOverlap(card, topicKeywords);
   const { dated, note } = preGradeDated(card);
   return {
-    onTopic: overlap >= ON_TOPIC_OVERLAP_THRESHOLD,
+    onTopic: overlap >= onTopicThreshold(card),
     dated,
     sourceNature: preGradeNature(card),
     note: `${note}; topic overlap ${Math.round(overlap * 100)}%`,
@@ -520,6 +535,7 @@ export async function runCritic(options: RunCriticOptions): Promise<RunCriticRes
       title: card.title,
       text: `${card.relevantClaim} ${card.supportingExcerpt}`,
       query: topic,
+      sourceTier: card.sourceTier,
     };
     const heuristic = passesHeuristicFilter(input);
     if (heuristic.pass) {
@@ -638,13 +654,10 @@ export function buildRetryQueries(
   const queries: string[] = [];
   for (const card of failed) {
     if (queries.length >= max) break;
-    const claim = (card.relevantClaim || "")
-      .replace(/\s+/g, " ")
-      .replace(/[|]/g, "")
-      .trim()
-      .slice(0, 120);
-    if (!claim) continue;
-    const q = `${topic} ${claim}`.replace(/\s+/g, " ").trim().slice(0, 250);
+    // Failed claims can be full evidence-card metadata
+    // ("[OpenAlex Peer-Reviewed Work] Title: ... Abstract: ..."). Strip the
+    // brackets/labels before reusing them as a search query.
+    const q = sanitizeSearchQuery(`${topic} ${card.relevantClaim ?? ""}`, 10);
     if (!q || queries.includes(q)) continue;
     queries.push(q);
   }

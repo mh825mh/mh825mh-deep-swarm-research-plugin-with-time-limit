@@ -37,6 +37,16 @@ describe("withHardTimeout", () => {
       withHardTimeout(Promise.reject(new Error("boom")), 5_000, "fb", "Test"),
     ).rejects.toThrow("boom");
   });
+
+  it("resolves with the fallback when the work rejects after the timeout", async () => {
+    const lateReject = new Promise<string>((_, reject) => {
+      setTimeout(() => reject(new Error("late failure")), 40);
+    });
+    const value = await withHardTimeout(lateReject, 10, "fallback", "Feeds");
+    expect(value).toBe("fallback");
+    // Let the late rejection settle; Promise.race already attached a handler.
+    await new Promise((r) => setTimeout(r, 60));
+  });
 });
 
 describe("EngineRequestPacer", () => {

@@ -9,6 +9,80 @@ import {
   ReasoningEffort,
 } from "./qwen-parser";
 
+/**
+ * In a plugin context the SDK forbids `new LMStudioClient()`; callers must reuse
+ * the authenticated client attached to the plugin controller. The tools
+ * provider hands us that client once at startup, and `.lmstudio/entry.ts` also
+ * publishes it on globalThis as a last-resort fallback.
+ */
+let controllerClient: LMStudioClient | null = null;
+let fallbackClient: LMStudioClient | null = null;
+
+export function setLlmClient(client?: LMStudioClient | null): void {
+  controllerClient = client ?? null;
+}
+
+export function getLlmClient(controller?: {
+  client?: LMStudioClient;
+}): LMStudioClient {
+  const attached = controller?.client ?? controllerClient;
+  if (attached) {
+    controllerClient = attached;
+    return attached;
+  }
+
+  const runtime = globalThis as {
+    __LMS_PLUGIN_CLIENT__?: LMStudioClient;
+    __LMS_PLUGIN_CONTEXT?: boolean;
+  };
+  if (runtime.__LMS_PLUGIN_CLIENT__) {
+    controllerClient = runtime.__LMS_PLUGIN_CLIENT__;
+    return controllerClient;
+  }
+
+  if (runtime.__LMS_PLUGIN_CONTEXT) {
+    // Never fall through to `new LMStudioClient()` here: that is exactly the
+    // error this helper exists to avoid.
+    throw new Error(
+      "LM Studio client unavailable: the plugin controller's client was not attached.",
+    );
+  }
+
+  if (!fallbackClient) {
+    const baseUrl =
+      process.env.LM_STUDIO_BASE_URL ||
+      process.env.LMS_PLUGIN_BASE_URL ||
+      "ws://127.0.0.1:1234";
+    const clientIdentifier = process.env.LMS_PLUGIN_CLIENT_IDENTIFIER;
+    const clientPasskey = process.env.LMS_PLUGIN_CLIENT_PASSKEY;
+    fallbackClient =
+      clientIdentifier && clientPasskey
+        ? new LMStudioClient({ baseUrl, clientIdentifier, clientPasskey })
+        : new LMStudioClient({ baseUrl });
+  }
+  return fallbackClient;
+}
+
+/**
+ * Last prediction failure, kept for the planner status line. The old helpers
+ * swallowed every error, so a 2 ms `listLoaded()`/`respond()` failure looked
+ * identical to "the model returned nothing".
+ */
+let lastLlmError: string | null = null;
+
+export function getLastLlmError(): string | null {
+  return lastLlmError;
+}
+
+export function resetLastLlmError(): void {
+  lastLlmError = null;
+}
+
+function noteLlmError(scope: string, err: unknown): void {
+  const message = err instanceof Error ? err.message : String(err);
+  lastLlmError = `${scope}: ${message}`;
+}
+
 /** Mutable sink the streaming helpers fill with a model's reasoning trace. */
 export interface ReasoningCapture {
   trace: string;
@@ -127,47 +201,20 @@ export interface AskStructuredOptions extends AskModelOptions {
   readonly jsonSchema: Record<string, unknown>;
 }
 
-/** Extra prediction-payload fields that carry thinking-control directives. */
-type ReasoningPayload = Record<string, unknown>;
-
 /**
  * True when thinking must be turned off: either an explicit `disableThinking`
  * flag or `reasoningEffort: 'none'` (used for repetitive / extraction tasks).
+ *
+ * The SDK prediction-config schema has no `enableThinking` /
+ * `chat_template_kwargs` fields (they were silently dropped at best and could
+ * be rejected by stricter runtimes at worst). `/no_think` in the final user
+ * message is the reliable cross-template switch, so that is all we use.
  */
 function thinkingDisabled(opts: {
   reasoningEffort?: ReasoningEffort;
   disableThinking?: boolean;
 }): boolean {
   return opts.disableThinking === true || opts.reasoningEffort === "none";
-}
-
-/**
- * Builds the extra prediction-config fields for thinking control.
- *
- * The LM Studio JS SDK only exposes the experimental `enableThinking` boolean,
- * so we set that (guaranteed to work) and additionally pass the raw
- * `chat_template_kwargs: { enable_thinking: false }` + `reasoning` fields via an
- * untyped payload for runtimes that accept them.
- */
-function buildReasoningConfig(opts: {
-  reasoningEffort?: ReasoningEffort;
-  disableThinking?: boolean;
-}): ReasoningPayload {
-  if (thinkingDisabled(opts)) {
-    return {
-      enableThinking: false,
-      chat_template_kwargs: { enable_thinking: false },
-      reasoning: "off",
-    };
-  }
-  if (opts.reasoningEffort) {
-    return {
-      enableThinking: true,
-      chat_template_kwargs: { enable_thinking: true },
-      reasoning: opts.reasoningEffort,
-    };
-  }
-  return {};
 }
 
 /**
@@ -212,7 +259,6 @@ export function buildPredictionOptions(
   if (opts.maxTokens !== undefined) cfg.maxTokens = opts.maxTokens;
   if (opts.temperature !== undefined) cfg.temperature = opts.temperature;
   if (opts.structured !== undefined) cfg.structured = opts.structured;
-  Object.assign(cfg, buildReasoningConfig(opts));
   return cfg;
 }
 
@@ -242,24 +288,42 @@ export async function requestPrediction(
   if (opts.signal?.aborted) return null;
   const { maxTokens = 400, temperature = 0.7, timeoutMs = 60_000 } = opts;
   try {
-    const client = new LMStudioClient();
+    const client = getLlmClient();
     const models = await Promise.race([
       client.llm.listLoaded(),
       new Promise<never>((_, reject) =>
         setTimeout(() => reject(new Error("timeout")), timeoutMs),
       ),
     ]);
-    if (!Array.isArray(models) || models.length === 0) return null;
+    if (!Array.isArray(models) || models.length === 0) {
+      lastLlmError = "model: no loaded model";
+      return null;
+    }
     const model = await client.llm.model(models[0].identifier);
     const prepared = applyNoThink(messages, thinkingDisabled(opts));
-    const stream = model.respond(
-      prepared as never,
-      buildPredictionOptions({ maxTokens, temperature, ...opts }) as never,
-    );
-    const collected = await collectPredictionStream(stream as never);
-    if (opts.capture) opts.capture.trace = collected.reasoning;
-    return collected.text.trim() || null;
-  } catch {
+    try {
+      const stream = model.respond(
+        prepared as never,
+        buildPredictionOptions({ maxTokens, temperature, ...opts }) as never,
+      );
+      const collected = await collectPredictionStream(stream as never);
+      if (opts.capture) opts.capture.trace = collected.reasoning;
+      return collected.text.trim() || null;
+    } catch (err) {
+      noteLlmError("prediction", err);
+      if (opts.signal?.aborted) return null;
+      // Retry with the minimal, universally-supported prediction config. This
+      // is the fallback for runtimes that reject an optional config field.
+      const retryStream = model.respond(
+        prepared as never,
+        { maxTokens, temperature } as never,
+      );
+      const collected = await collectPredictionStream(retryStream as never);
+      if (opts.capture) opts.capture.trace = collected.reasoning;
+      return collected.text.trim() || null;
+    }
+  } catch (err) {
+    noteLlmError("model", err);
     return null;
   }
 }
@@ -312,36 +376,60 @@ export async function askStructured<S extends z.ZodTypeAny>(
   return llmSemaphore.run(async () => {
     if (signal?.aborted) return null;
     try {
-      const client = new LMStudioClient();
+      const client = getLlmClient();
       const models = await Promise.race([
         client.llm.listLoaded(),
         new Promise<never>((_, reject) =>
           setTimeout(() => reject(new Error("timeout")), timeoutMs),
         ),
       ]);
-      if (!Array.isArray(models) || models.length === 0) return null;
+      if (!Array.isArray(models) || models.length === 0) {
+        lastLlmError = "structured: no loaded model";
+        return null;
+      }
       const model = await client.llm.model(models[0].identifier);
       const prepared = applyNoThink(
         messages,
         thinkingDisabled({ reasoningEffort, disableThinking }),
       );
-      const stream = model.respond(
-        prepared as never,
-        buildPredictionOptions({
-          maxTokens,
-          temperature,
-          structured: { type: "json", jsonSchema },
-          reasoningEffort,
-          disableThinking,
-        }) as never,
-      );
-      const collected = await collectPredictionStream(stream as never);
-      if (capture) capture.trace = collected.reasoning;
-      if (!collected.text.trim()) return null;
-      // extractQwenJson strips <think> blocks + Markdown fences and locates the
-      // JSON boundaries; any failure falls through to the caller's fallback.
-      return schema.parse(extractQwenJson(collected.text));
-    } catch {
+      try {
+        const stream = model.respond(
+          prepared as never,
+          buildPredictionOptions({
+            maxTokens,
+            temperature,
+            structured: { type: "json", jsonSchema },
+            reasoningEffort,
+            disableThinking,
+          }) as never,
+        );
+        const collected = await collectPredictionStream(stream as never);
+        if (capture) capture.trace = collected.reasoning;
+        if (!collected.text.trim()) return null;
+        // extractQwenJson strips <think> blocks + Markdown fences and locates
+        // the JSON boundaries; any failure falls through to the caller.
+        return schema.parse(extractQwenJson(collected.text));
+      } catch (err) {
+        noteLlmError("structured prediction", err);
+        if (signal?.aborted) return null;
+        // Older/stricter runtimes may reject JSON-schema structured output.
+        // Retry as plain text and let extractQwenJson recover the JSON object.
+        try {
+          const retryStream = model.respond(
+            prepared as never,
+            { maxTokens, temperature } as never,
+          );
+          const collected = await collectPredictionStream(retryStream as never);
+          if (capture) capture.trace = collected.reasoning;
+          if (!collected.text.trim()) return null;
+          return schema.parse(extractQwenJson(collected.text));
+        } catch (retryErr) {
+          noteLlmError("structured retry", retryErr);
+          return null;
+        }
+      }
+    } catch (err) {
+      noteLlmError("structured model", err);
       return null;
     }
   });
@@ -354,7 +442,7 @@ export async function askStructured<S extends z.ZodTypeAny>(
  */
 export async function hasLoadedModel(timeoutMs = 5_000): Promise<boolean> {
   try {
-    const client = new LMStudioClient();
+    const client = getLlmClient();
     const models = await Promise.race([
       client.llm.listLoaded(),
       new Promise<never>((_, reject) =>

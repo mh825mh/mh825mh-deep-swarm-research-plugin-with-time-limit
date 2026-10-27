@@ -80,9 +80,9 @@ export const DIMENSIONS: ReadonlyArray<ResearchDimension> = [
       "now",
     ],
     queries: (t) => [
-      `${t} latest news 2025`,
+      `${t} latest news`,
       `${t} current state developments`,
-      `${t} recent updates 2026`,
+      `${t} recent updates`,
       `${t} latest breakthroughs`,
     ],
   },
@@ -203,7 +203,7 @@ export const DIMENSIONS: ReadonlyArray<ResearchDimension> = [
     ],
     queries: (t) => [
       `${t} future trends predictions`,
-      `${t} forecast outlook 2026 2027`,
+      `${t} forecast outlook`,
       `${t} emerging trends next generation`,
       `${t} what comes next`,
     ],

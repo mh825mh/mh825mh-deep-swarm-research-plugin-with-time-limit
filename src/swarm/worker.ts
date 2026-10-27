@@ -23,7 +23,12 @@ import {
   sharedDdgLimiter,
   wasLastSearchRateLimited,
 } from "../net/ddg";
-import { multiEngineSearch, SearchEngine } from "../net/search-engines";
+import {
+  isSearxLocalReachable,
+  multiEngineSearch,
+  prioritizeSearxng,
+  SearchEngine,
+} from "../net/search-engines";
 import { globalEnginePacer, ENGINE_PACE_MIN_INTERVAL_MS } from "./pluginBridgeAndPacer";
 import { SingleflightUrlFetcher, shouldFetchSerpCandidate } from "./singleflightAndSnippetGate";
 import { optimizeForQwen38 } from "../utils/qwenOptimizer";
@@ -134,6 +139,8 @@ export interface SharedCrawlState {
   markVisitedPersistent(source: CrawledSource): void;
   isRejected(url: string): boolean;
   markRejected(url: string, reason?: string): void;
+  /** Claims an (engine, query) pair for this run; false when already executed. */
+  claimEngineQuery(engine: string, query: string): boolean;
   getMetricsSnapshot(): Readonly<CrawlMetrics>;
   mergeMetrics(delta: Partial<CrawlMetrics>): void;
 }
@@ -226,6 +233,60 @@ export async function runWorker(
   const allHits: SearchHitLike[] = [];
   let ddgBlocked = false;
 
+  const searchOptions = {
+    serperApiKey: (task as any).serperApiKey,
+    braveApiKey: (task as any).braveApiKey,
+    rssFeedUrls: (task as any).rssFeedUrls,
+    telegramChannels: (task as any).telegramChannels,
+    flaresolverrUrl: (task as any).flaresolverrUrl,
+    searxngUrl: (task as any).searxngUrl,
+  };
+
+  const addSearchHits = (
+    hits: ReadonlyArray<SearchHit>,
+    sourceQuery: string,
+    requestedRoute: string,
+    actualBackend: string,
+  ): void => {
+    for (const hit of hits) {
+      let resultDomain = "";
+      try {
+        resultDomain = new URL(hit.url).hostname.replace(/^www\./, "");
+      } catch {}
+      allHits.push({
+        ...hit,
+        query: sourceQuery,
+        requestedRoute,
+        actualBackend,
+        resultDomain,
+      });
+    }
+  };
+
+  const runSearxng = async (q: string): Promise<ReadonlyArray<SearchHit>> => {
+    metrics.extraEngineQueries++;
+    try {
+      const hits = await multiEngineSearch(
+        q,
+        Math.min(task.searchResultsPerQuery, EXTRA_ENGINE_MAX_RESULTS),
+        ["searxng"],
+        signal,
+        () => limiter,
+        task.timeRange ?? "all",
+        searchOptions,
+      );
+      metrics.extraEngineHits += hits.length;
+      health.recordOtherEngineHit("searxng", hits.length);
+      if (task.enableAdaptiveLearning !== false) getEngineStats().record("searxng", hits.length);
+      llmManager.recordProgress();
+      return hits;
+    } catch {
+      health.recordOtherEngineHit("searxng", 0);
+      if (task.enableAdaptiveLearning !== false) getEngineStats().record("searxng", 0);
+      return [];
+    }
+  };
+
   for (const query of task.queries) {
     if (signal.aborted) break;
 
@@ -240,8 +301,37 @@ export async function runWorker(
     let ddgHits: ReadonlyArray<SearchHit> = [];
     let effectiveHitCount = 0;
 
-        // 4. DDG FAILURE DEFINITION & HEALTH TRACKING
-    if (task.extraEngines.includes("ddg") && health.isDdgAvailable()) {
+    // LOCAL-FIRST WATERFALL: when the run-start probe found the local SearXNG
+    // instance reachable, it is promoted to index 0 ahead of DDG. DDG remains
+    // the next engine in the same per-query waterfall.
+    const engineOrder = prioritizeSearxng(task.extraEngines, isSearxLocalReachable());
+    const enginesTried = new Set<string>();
+    const searxPrimary =
+      engineOrder[0] === "searxng" && health.isOtherEngineAvailable("searxng");
+
+    if (searxPrimary && state.claimEngineQuery("searxng", query)) {
+      enginesTried.add("searxng");
+      const searxHits = await runSearxng(query);
+      if (searxHits.length > 0) {
+        addSearchHits(searxHits, query, "SEARXNG", "SEARXNG");
+        effectiveHitCount = searxHits.length;
+        queriesExecuted.push(query);
+        status(`${roleTag} SEARXNG: "${query}" -> ${searxHits.length} results`);
+      } else {
+        warn(`${roleTag} SEARXNG returned INVALID_RESULT_SET (0 results) — falling through to DDG.`);
+      }
+    }
+
+    // 4. DDG FAILURE DEFINITION & HEALTH TRACKING
+    let ddgAttempted = false;
+    if (
+      engineOrder.includes("ddg") &&
+      health.isDdgAvailable() &&
+      !(searxPrimary && effectiveHitCount > 0) &&
+      state.claimEngineQuery("ddg", query)
+    ) {
+      ddgAttempted = true;
+      enginesTried.add("ddg");
       metrics.ddgQueries++;
       try {
         // Random human-like pause before querying DDG (2-8 seconds)
@@ -301,6 +391,30 @@ export async function runWorker(
            await sleep(penalty);
            ddgBlocked = true; 
         }
+
+        // IMMEDIATE PER-QUERY FAILOVER: a 0-result DDG must not wait for the
+        // mutation phase or a later layer. If local SearXNG is alive and has not
+        // already been tried for this query, query it right now.
+        if (
+          msg.includes("INVALID_RESULT_SET") &&
+          !enginesTried.has("searxng") &&
+          isSearxLocalReachable() &&
+          state.claimEngineQuery("searxng", query)
+        ) {
+          enginesTried.add("searxng");
+          const failoverHits = await runSearxng(query);
+          if (failoverHits.length > 0) {
+            addSearchHits(failoverHits, query, "SEARXNG-FAILOVER", "SEARXNG");
+            effectiveHitCount = failoverHits.length;
+            queriesExecuted.push(query);
+            ddgBlocked = true; // skip the slow DDG mutation phase
+            status(
+              `${roleTag} DDG INVALID_RESULT_SET -> SEARXNG failover: "${query}" -> ${failoverHits.length} results`,
+            );
+          } else {
+            warn(`${roleTag} SEARXNG failover also returned 0 results for "${query}".`);
+          }
+        }
       }
     }
 
@@ -308,6 +422,7 @@ export async function runWorker(
     const isHighlyRestrictive = query.includes("site:");
     
     if (
+      ddgAttempted &&
       ddgHits.length < task.queryMutationThreshold &&
       !signal.aborted &&
       !ddgBlocked &&
@@ -341,6 +456,7 @@ export async function runWorker(
 
       for (const { text: mutated, strategyIndex } of mutationsToTry) {
         if (signal.aborted || Date.now() >= mutationDeadline) break;
+        if (!state.claimEngineQuery("ddg", mutated)) continue;
         metrics.mutatedQueriesTried++;
         metrics.ddgQueries++;
 
@@ -384,7 +500,10 @@ export async function runWorker(
         if (task.extraEngines.length > 0 && !signal.aborted) {
           const trackedEngines = new Set<SearchEngine>(["bing", "brave", "google", "scholar", "searxng", "mojeek", "yandex", "youtube"]);
           const usableEngines = (task.extraEngines as ReadonlyArray<SearchEngine>).filter(
-            (engine) => !trackedEngines.has(engine) || health.isOtherEngineAvailable(engine),
+            (engine) =>
+              !enginesTried.has(engine) &&
+              (!trackedEngines.has(engine) || health.isOtherEngineAvailable(engine)) &&
+              state.claimEngineQuery(engine, bestMutation!.query),
           );
           if (usableEngines.length > 0) {
             try {
@@ -424,7 +543,10 @@ export async function runWorker(
         // gdelt, reference, rss, telegram, ddg) running unconditionally.
         const trackedEngines = new Set<SearchEngine>(["bing", "brave", "google", "scholar", "searxng", "mojeek", "yandex", "youtube"]);
         const usableEngines = (task.extraEngines as ReadonlyArray<SearchEngine>).filter(
-          (engine) => !trackedEngines.has(engine) || health.isOtherEngineAvailable(engine),
+          (engine) =>
+            !enginesTried.has(engine) &&
+            (!trackedEngines.has(engine) || health.isOtherEngineAvailable(engine)) &&
+            state.claimEngineQuery(engine, query),
         );
 
         // API-as-second-fallback: when the free engines under-deliver (blocked,
@@ -437,7 +559,11 @@ export async function runWorker(
             "brave-api": (task as any).braveApiKey as string | undefined,
           };
           for (const [engine, key] of Object.entries(apiKeys)) {
-            if (key && !usableEngines.includes(engine as SearchEngine)) {
+            if (
+              key &&
+              !usableEngines.includes(engine as SearchEngine) &&
+              state.claimEngineQuery(engine, query)
+            ) {
               usableEngines.push(engine as SearchEngine);
               health.apiCallsMade++;
             }
@@ -445,7 +571,7 @@ export async function runWorker(
         }
 
         if (usableEngines.length === 0) {
-          warn(`${roleTag} All extra engines in cooldown, skipping extra-engine search.`);
+          warn(`${roleTag} All extra engines already tried or in cooldown, skipping extra-engine search.`);
         } else {
           const extraHits = await multiEngineSearch(
             query,

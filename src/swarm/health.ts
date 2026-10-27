@@ -121,6 +121,13 @@ export class SearchHealthTracker {
   }
 
   public recordOtherEngineHit(engine: string, hitCount: number, reason?: string) {
+    // SearXNG has its own first-class health block in the report. Point the
+    // otherEngines entry at the same state object so every existing
+    // recordOtherEngineHit("searxng", ...) call updates both views (otherwise
+    // "SEARXNG HEALTH → Searches attempted" stayed at 0 forever).
+    if (engine === "searxng") {
+      this.otherEngines[engine] = this.searxng;
+    }
     const state = (this.otherEngines[engine] = this.otherEngines[engine] ?? this.freshState());
     state.searchesAttempted++;
     if (hitCount >= 1) {

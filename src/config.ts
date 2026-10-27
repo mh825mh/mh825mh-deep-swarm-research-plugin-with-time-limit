@@ -82,7 +82,7 @@ export const configSchematics = createConfigSchematics()
     {
       displayName: "Max Session Time (minutes)",
       subtitle:
-        "Wall-clock cap per run (min of this and the LLM Call Mode runtime cap). 0 = no session limit.",
+        "Wall-clock cap per run (min of this and the LLM Call Mode runtime cap). 0 = use the LLM Call Mode runtime cap.",
       min: 0,
       max: 240,
       int: true,

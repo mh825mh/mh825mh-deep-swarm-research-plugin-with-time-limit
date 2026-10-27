@@ -9,6 +9,7 @@ import {
 } from "../planning/planner";
 import { detectCoveredDimensions, DIMENSIONS, detectGaps } from "../planning/dimensions";
 import { seedFromTierZeroJsonApis } from "../net/tierZeroJsonSeeder";
+import { InRunQueryTracker } from "../net/queryCache";
 import { selectAdaptiveFallbackDimensions } from "./singleflightAndSnippetGate";
 import { resolveSkillPackWithFallback } from "../utils/qwenOptimizer";
 import { loadSkillPack } from "../skills/loader";
@@ -43,7 +44,15 @@ import { persistRunMemory } from "../memory/persist";
 import { retrieveMemoryForTopic } from "../memory/retrieve";
 import { querySiblingPluginCaches, withHardTimeout } from "./pluginBridgeAndPacer";
 import { probeFlareSolverr, resetFsStats } from "../net/waterfallFetcher";
-import { getSearxLocalStats, probeSearxLocal, resetSearxLocalStats } from "../net/search-engines";
+import {
+  getSearxLocalStats,
+  isSearxLocalReachable,
+  prioritizeSearxng,
+  probeSearxLocal,
+  resetSearxLocalStats,
+} from "../net/search-engines";
+import { buildCoreTopicQuery } from "../utils/topicQuery";
+import { computeCrawlBudgetMs, resolveEffectiveRuntimeMs } from "../utils/timeBudget";
 import { resetDecodoSession, setDecodoToken, getDecodoStats } from "../net/decodoApi";
 import fs from "node:fs";
 import path from "node:path";
@@ -184,6 +193,7 @@ class MutableCrawlState implements SharedCrawlState {
   private readonly _failedUrls = new Map<string, { count: number; reason: string; lastFailedAt: string }>();
   private readonly _failedHosts = new Map<string, { count: number; reason: string; lastFailedAt: string }>();
   private readonly visitedCache: VisitedPageCache;
+  private readonly engineQueries = new InRunQueryTracker();
   private _metrics: CrawlMetrics = zeroMetrics();
 
   constructor(cacheDurationDays: number = 30) {
@@ -273,6 +283,9 @@ class MutableCrawlState implements SharedCrawlState {
   markVisitedPersistent(source: CrawledSource): void { this.visitedCache.markVisited(source); }
   isRejected(url: string): boolean { return this.visitedCache.isRejected(url); }
   markRejected(url: string, reason?: string): void { this.visitedCache.markRejected(url, reason); }
+  claimEngineQuery(engine: string, query: string): boolean {
+    return this.engineQueries.shouldExecute(engine, query);
+  }
   pruneVisitedCache(): void { this.visitedCache.prune(); }
   cacheStats(): VisitedCacheStats { return this.visitedCache.stats(); }
   flushCache(): void { this.visitedCache.flush(); }
@@ -293,6 +306,7 @@ function getEnginesForRole(
   cfg: ResearchConfig,
   mode: "adaptive" | "benchmark" | "priority"
 ): ReadonlyArray<string> {
+  const localSearx = isSearxLocalReachable();
   const freeEngines: string[] = ["ddg", "bing", "brave"];
   if (cfg.enableReferenceSearch) freeEngines.push("reference");
   if (cfg.enableAcademicAPIs) freeEngines.push("openalex", "crossref", "arxiv");
@@ -300,9 +314,13 @@ function getEnginesForRole(
   if (cfg.rssFeedUrls && cfg.rssFeedUrls.length > 0) freeEngines.push("rss");
   if (cfg.telegramChannels && cfg.telegramChannels.length > 0) freeEngines.push("telegram");
   freeEngines.push("gdelt");
+  if (localSearx) freeEngines.push("searxng");
 
   if (mode === "benchmark") {
-    return [...freeEngines, cfg.serperApiKey ? "serper" : "", cfg.braveApiKey ? "brave-api" : ""].filter(Boolean);
+    return prioritizeSearxng(
+      [...freeEngines, cfg.serperApiKey ? "serper" : "", cfg.braveApiKey ? "brave-api" : ""].filter(Boolean),
+      localSearx,
+    );
   }
 
   const roleEngines: string[] = [];
@@ -312,12 +330,13 @@ function getEnginesForRole(
   if (role === "recency" || role === "critical") roleEngines.push("gdelt");
 
   roleEngines.push("ddg", "bing", "brave");
+  if (localSearx) roleEngines.push("searxng");
 
   if (mode === "priority" && cfg.enableAdaptiveLearning !== false) {
-    return getEngineStats().orderEngines(roleEngines);
+    return prioritizeSearxng(getEngineStats().orderEngines(roleEngines), localSearx);
   }
 
-  return roleEngines;
+  return prioritizeSearxng(roleEngines, localSearx);
 }
 
 function rolesForProfile(profile: DepthProfile): ReadonlyArray<WorkerRole> {
@@ -481,12 +500,14 @@ function buildGapTasks(
   if (cfg.serperApiKey) gapEngines.push("serper");
   if (cfg.braveApiKey) gapEngines.push("brave-api");
   if (gapEngines.length === 0) gapEngines.push("ddg", "bing", "brave");
+  if (isSearxLocalReachable()) gapEngines.push("searxng");
+  const orderedGapEngines = prioritizeSearxng(gapEngines, isSearxLocalReachable());
 
   for (const [subIdx, gapPlan] of gapPlans.entries()) {
     if (gapPlan.queries.length === 0) continue;
     tasks.push({
       ...buildTaskBase(profile, cfg),
-      extraEngines: gapEngines,
+      extraEngines: orderedGapEngines,
       id: `gap-${gapPlan.role}-r${round}-s${subIdx}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
       role: gapPlan.role,
       label: subIdx > 0 ? `${gapPlan.label} #${subIdx + 1}` : gapPlan.label,
@@ -499,6 +520,17 @@ function buildGapTasks(
   return tasks;
 }
 
+interface TaskGroupScope {
+  /** Extra cancellation signal local to this pass (e.g. the Feeds timeout). */
+  readonly extraSignal?: AbortSignal;
+  /**
+   * When false, this pass does not run the LLM stall watchdog at all. Used for
+   * short bounded passes (Feeds) whose orphaned timer must never be able to
+   * mutate/abort the global LlmCallManager.
+   */
+  readonly watchdogEnabled?: boolean;
+}
+
 async function runTaskGroup(
   tasks: ReadonlyArray<SwarmTask>,
   state: SharedCrawlState,
@@ -508,16 +540,24 @@ async function runTaskGroup(
   warn: WarnFn,
   topicKeywords: ReadonlyArray<string>,
   health: SearchHealthTracker,
-  llmManager: LlmCallManager
+  llmManager: LlmCallManager,
+  scope: TaskGroupScope = {},
 ): Promise<WorkerResult[]> {
-  const combined = combineAbortSignals(signal, llmManager.signal);
+  const combined = combineAbortSignals(
+    signal,
+    llmManager.signal,
+    scope.extraSignal,
+  );
 
-  const watchdog = setInterval(() => {
-    if (llmManager.checkStall() && !llmManager.signal.aborted) {
-      llmManager.abort();
-      warn("[WATCHDOG] Stall detected (no accepted sources for 2 minutes). Flushing partial results to synthesis.");
-    }
-  }, 10_000);
+  const watchdog =
+    scope.watchdogEnabled === false
+      ? null
+      : setInterval(() => {
+          if (llmManager.checkStall() && !llmManager.signal.aborted) {
+            llmManager.abort();
+            warn("[WATCHDOG] Stall detected (no accepted sources for 2 minutes). Flushing partial results to synthesis.");
+          }
+        }, 10_000);
 
   try {
     return await Promise.all(
@@ -549,7 +589,7 @@ async function runTaskGroup(
       }),
     );
   } finally {
-    clearInterval(watchdog);
+    if (watchdog) clearInterval(watchdog);
   }
 }
 
@@ -575,6 +615,8 @@ export interface OrchestratorResult {
     readonly ddgState: EngineState;
     readonly ddgQueries: number;
     readonly ddgBlocks: number;
+    readonly searxngQueries: number;
+    readonly searxngValidResults: number;
     readonly pagesArchived: number;
     readonly archiveSubmitFailures: number;
     readonly llmCallsUsed: number;
@@ -613,6 +655,8 @@ export interface SharedCrawlState {
   markVisitedPersistent(source: CrawledSource): void;
   isRejected(url: string): boolean;
   markRejected(url: string, reason?: string): void;
+  /** Claims an (engine, query) pair for this run; false when already executed. */
+  claimEngineQuery(engine: string, query: string): boolean;
   pruneVisitedCache(): void;
   cacheStats(): VisitedCacheStats;
   flushCache(): void;
@@ -715,10 +759,10 @@ export async function runSwarm(
       cfg.enableAIPlanning,
       fileStatus,
       profile,
+      // Planner calls were previously invisible to the run budget, so a
+      // successful Qwen plan could still report "LLM calls used: 0".
+      () => llmManager.recordCall("planner"),
     );
-    if (!plan.usedAI) {
-      fileStatus("AI unavailable, using dimension-based query planning");
-    }
   } catch (err: any) {
     const msg = err?.message ?? String(err);
     fileWarn(`[AI PLANNER FAILED] Reason: ${msg}`);
@@ -777,18 +821,22 @@ export async function runSwarm(
     }
   }
 
-  // Time budget: keep min(session, LLM mode cap) for a finite session. A value
-  // of 0 means "no session limit" for crawling (LLM calls remain bounded by the
-  // mode budget). The effective runtime is enforced by a real wall-clock timer.
+  // Time budget: 0 means "no user session limit", but the run is still bounded
+  // by the LLM Call Mode runtime cap. computeCrawlBudgetMs() guarantees a finite
+  // positive crawl budget (mode cap * 0.80) instead of multiplying 0 * 0.8 = 0,
+  // which used to end the crawl immediately after the Feeds pass.
   const sessionLimitMs =
-    cfg.maxSessionMs && cfg.maxSessionMs > 0 ? cfg.maxSessionMs : Infinity;
+    cfg.maxSessionMs && cfg.maxSessionMs > 0 ? cfg.maxSessionMs : 0;
   const modeRuntimeCapMs = llmManager.budget.maxRuntimeMs;
-  const effectiveRuntimeMs =
-    sessionLimitMs === Infinity ? Infinity : Math.min(sessionLimitMs, modeRuntimeCapMs);
-  const fmtMin = (ms: number) => (ms === Infinity ? "unlimited" : `${Math.round(ms / 60000)}m`);
+  const effectiveRuntimeMs = resolveEffectiveRuntimeMs(
+    sessionLimitMs,
+    modeRuntimeCapMs,
+  );
+  const crawlBudgetMs = computeCrawlBudgetMs(sessionLimitMs, modeRuntimeCapMs);
+  const fmtMin = (ms: number) =>
+    !Number.isFinite(ms) || ms <= 0 ? "unlimited" : `${Math.round(ms / 60000)}m`;
   const startTime = Date.now();
-  const crawlDeadline =
-    effectiveRuntimeMs === Infinity ? Infinity : startTime + effectiveRuntimeMs * 0.80; // Reserve 20% for synthesis
+  const crawlDeadline = startTime + crawlBudgetMs; // 20% reserved for synthesis
 
   // item 5: the shared blackboard — plan, gaps, cards, blocked_urls, time_left.
   const blackboard = new SwarmBlackboard(() => state.listBlockedUrls(), crawlDeadline);
@@ -858,8 +906,9 @@ export async function runSwarm(
   ) {
     fileStatus(`\n⚡ TIER-0: Pre-seeding verified keyless JSON sources (OpenAlex + Wikipedia REST)...`);
     try {
+      const seedQuery = buildCoreTopicQuery(cfg.topic, 4);
       const seedCards = await seedFromTierZeroJsonApis(
-        cfg.topic,
+        seedQuery,
         cfg.crossrefMailto,
         fileStatus,
       );
@@ -929,16 +978,11 @@ export async function runSwarm(
         followLinks: true,
       }));
 
-  let externalTasks = buildGapTasks(gapPlanInputs, 1, profile, cfg).map(task => {
-    // ENCYCLOPEDIA FORCING: Append site operators for academic/breadth roles
-    if (cfg.enableReferenceSearch && (task.role === "academic" || task.role === "breadth")) {
-      return {
-        ...task,
-        queries: task.queries.map(q => `${q} (site:wikipedia.org OR site:britannica.com OR site:encyclopedia.com)`)
-      };
-    }
-    return task;
-  });
+  // Reference/encyclopedia coverage is provided by the dedicated "reference"
+  // engine and the Tier-0 JSON pre-seed. Do NOT append site: operators here:
+  // they turned every deterministic query into a 15+ word boolean string that
+  // DDG/SearXNG HTML endpoints frequently reject.
+  let externalTasks = buildGapTasks(gapPlanInputs, 1, profile, cfg);
 
   fileStatus(
     `[RUN CONTROL] Session limit: ${fmtMin(sessionLimitMs)} | LLM mode cap: ${fmtMin(modeRuntimeCapMs)} | Effective runtime: ${fmtMin(effectiveRuntimeMs)} (crawl stops at 80%)`,
@@ -1006,15 +1050,40 @@ export async function runSwarm(
         label: "Feeds",
         extraEngines: feedEngines,
       };
-      const feedResults = await withHardTimeout(
-        runTaskGroup(
-          [feedTask], state, pool, signal, fileStatus, fileWarn, plan.topicKeywords, health, llmManager,
-        ),
-        12_000,
-        [] as WorkerResult[],
-        "Feeds",
-        fileWarn,
-      );
+      // Isolate the Feeds pass: it gets its own abort scope and runs WITHOUT
+      // the LLM stall watchdog. The 12s timeout resolves with [] but the
+      // underlying task group is then aborted, so an orphaned Feeds watchdog
+      // can never call llmManager.abort() and trip the whole swarm.
+      const feedAbort = new AbortController();
+      let feedResults: WorkerResult[] = [];
+      try {
+        feedResults = await withHardTimeout(
+          runTaskGroup(
+            [feedTask],
+            state,
+            pool,
+            signal,
+            fileStatus,
+            fileWarn,
+            plan.topicKeywords,
+            health,
+            llmManager,
+            { extraSignal: feedAbort.signal, watchdogEnabled: false },
+          ),
+          12_000,
+          [] as WorkerResult[],
+          "Feeds",
+          fileWarn,
+        );
+      } catch (feedErr) {
+        // A Feeds failure must never abort the swarm; the pass is optional.
+        fileWarn(
+          `[Feeds] Pass failed (${feedErr instanceof Error ? feedErr.message : String(feedErr)}) — continuing pipeline.`,
+        );
+        feedResults = [];
+      } finally {
+        feedAbort.abort();
+      }
       const prevFeedCount = allSources.length;
       aggregateResults(feedResults, allSources, allQueries, allErrors);
       fileStatus(`✅ Feeds pass complete. Added ${allSources.length - prevFeedCount} source(s).`);
@@ -1023,9 +1092,30 @@ export async function runSwarm(
     }
   }
 
-  for (const layer of ["DDG", "SEARXNG", "DIRECT", "API"]) {
-    if (Date.now() >= crawlDeadline || signal.aborted || llmManager.signal.aborted || externalTasks.length === 0) {
-      fileWarn(`[TIME ALLOCATION] Crawl budget elapsed, swarm stalled, or tasks finished. Transitioning to verification & synthesis.`);
+  // Local SearXNG is a local-first engine: when the run-start probe found it
+  // reachable, it becomes the primary external layer ahead of DDG. DDG remains
+  // in the same waterfall as the immediate per-query fallback.
+  const localSearxReachable = isSearxLocalReachable();
+  const layerSequence = localSearxReachable
+    ? ["SEARXNG", "DIRECT", "API"]
+    : ["DDG", "SEARXNG", "DIRECT", "API"];
+
+  for (const layer of layerSequence) {
+    const budgetExpired = Date.now() >= crawlDeadline;
+    if (
+      budgetExpired ||
+      signal.aborted ||
+      llmManager.signal.aborted ||
+      externalTasks.length === 0
+    ) {
+      const reason = budgetExpired
+        ? `Crawl budget elapsed (${Math.round((Date.now() - startTime) / 60000)}m elapsed, cap ${Math.round(crawlBudgetMs / 60000)}m)`
+        : signal.aborted || llmManager.signal.aborted
+          ? "Swarm aborted by an external signal or the stall watchdog"
+          : "No external gap tasks remain";
+      fileWarn(
+        `[TIME ALLOCATION] ${reason}. Transitioning to verification & synthesis.`,
+      );
       break;
     }
 
@@ -1035,9 +1125,18 @@ export async function runSwarm(
     const trackedEngines = new Set(["bing", "brave", "google", "scholar", "searxng", "mojeek", "yandex", "youtube"]);
 
     let layerEngines: string[] = [];
-    if (layer === "DDG" && health.isDdgAvailable()) layerEngines = ["ddg"];
-    else if (layer === "SEARXNG" && !health.isDdgAvailable()) layerEngines = ["searxng"];
-    else if (layer === "DIRECT") {
+    if (layer === "DDG" && health.isDdgAvailable()) {
+      layerEngines = ["ddg"];
+    } else if (layer === "SEARXNG") {
+      if (localSearxReachable) {
+        layerEngines = ["searxng"];
+        if (health.isDdgAvailable()) layerEngines.push("ddg");
+      } else if (!health.isDdgAvailable()) {
+        layerEngines = ["searxng"];
+      }
+    } else if (layer === "DIRECT") {
+      // SearXNG belongs to its own primary layer only. Letting it into DIRECT
+      // (or API) made it re-run the same queries and hijack every other engine.
       const free = ["bing", "brave", "google", "scholar", "mojeek", "yandex", "youtube", "reference", "gdelt"];
       layerEngines = free.filter(
         (engine) => !trackedEngines.has(engine) || health.isOtherEngineAvailable(engine),
@@ -1048,6 +1147,12 @@ export async function runSwarm(
       if (cfg.serperApiKey) apiEngines.push("serper");
       if (cfg.braveApiKey) apiEngines.push("brave-api");
       layerEngines = apiEngines;
+    }
+
+    // Paid API fallback stays last: do not re-insert the free SearXNG engine
+    // into the API layer after it has already run.
+    if (layer !== "API") {
+      layerEngines = prioritizeSearxng(layerEngines, localSearxReachable);
     }
 
     if (layerEngines.length === 0) continue;
@@ -1358,10 +1463,13 @@ export async function runSwarm(
         engineHits: [
           { engine: "ddg", hits: health.ddg.validResults },
           { engine: "searxng", hits: health.searxng.validResults },
-          ...Object.entries(health.otherEngines).map(([engine, e]) => ({
-            engine,
-            hits: e.validResults,
-          })),
+          ...Object.entries(health.otherEngines)
+            // searxng shares its state object with the first-class block above.
+            .filter(([engine]) => engine !== "searxng")
+            .map(([engine, e]) => ({
+              engine,
+              hits: e.validResults,
+            })),
         ],
         failedUrls: Array.from(failState._failedUrls.keys()),
         failedHosts: Array.from(failState._failedHosts.keys()),
@@ -1471,6 +1579,8 @@ function buildRunStats(
     ddgState: health.ddg.state,
     ddgQueries: health.ddg.searchesAttempted,
     ddgBlocks: health.ddg.blocks,
+    searxngQueries: health.searxng.searchesAttempted,
+    searxngValidResults: health.searxng.validResults,
     pagesArchived: archive.submitted,
     archiveSubmitFailures: archive.failed + archive.skipped,
     llmCallsUsed: llmManager.watchdog.llmCallsMade,
@@ -1522,26 +1632,25 @@ function isAbortError(err: unknown): boolean {
   return err instanceof DOMException && err.name === "AbortError";
 }
 
-function combineAbortSignals(a: AbortSignal, b: AbortSignal): AbortSignal {
+function combineAbortSignals(...signals: Array<AbortSignal | undefined>): AbortSignal {
+  const active = signals.filter((s): s is AbortSignal => Boolean(s));
   const ctor = AbortSignal as unknown as { any?: (signals: AbortSignal[]) => AbortSignal };
   if (typeof ctor.any === "function") {
     try {
-      return ctor.any([a, b]);
+      return ctor.any(active);
     } catch {
       // fall through to manual composition
     }
   }
   const composite = new AbortController();
   const onAbort = () => composite.abort();
-  if (a.aborted || b.aborted) {
+  if (active.some((s) => s.aborted)) {
     composite.abort();
   } else {
-    a.addEventListener("abort", onAbort);
-    b.addEventListener("abort", onAbort);
+    for (const signal of active) signal.addEventListener("abort", onAbort);
   }
   composite.signal.addEventListener("abort", () => {
-    a.removeEventListener("abort", onAbort);
-    b.removeEventListener("abort", onAbort);
+    for (const signal of active) signal.removeEventListener("abort", onAbort);
   });
   return composite.signal;
 }

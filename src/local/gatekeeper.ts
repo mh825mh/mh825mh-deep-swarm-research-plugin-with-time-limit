@@ -9,8 +9,7 @@
  * previous worker turns, so no `<think>` context chains leak into the gate.
  */
 
-import { LMStudioClient } from "@lmstudio/sdk";
-import { buildPredictionOptions } from "../utils/llm";
+import { buildPredictionOptions, getLlmClient } from "../utils/llm";
 import { optimizeForQwen38 } from "../utils/qwenOptimizer";
 
 export type GateDecision = "yes" | "no" | "error" | "unavailable";
@@ -37,7 +36,7 @@ export async function topicNeedsLocalSources(
   const { topic, signal } = options;
   try {
     if (signal?.aborted) return "error";
-    const client = new LMStudioClient();
+    const client = getLlmClient();
     const models = await client.llm.listLoaded();
     if (!models || models.length === 0) return "unavailable";
     const model = await client.llm.model(models[0].identifier);
@@ -58,18 +57,31 @@ export async function topicNeedsLocalSources(
     if (optimized.assistantPrefill) {
       messages.push({ role: "assistant", content: optimized.assistantPrefill });
     }
-    const stream = model.respond(
-      messages as never,
-      buildPredictionOptions({
-        maxTokens: optimized.maxTokens,
-        temperature: optimized.temperature,
-        reasoningEffort: "none",
-        disableThinking: true,
-      }) as never,
-    );
+    const predictionOptions = buildPredictionOptions({
+      maxTokens: optimized.maxTokens,
+      temperature: optimized.temperature,
+      reasoningEffort: "none",
+      disableThinking: true,
+    });
 
-    let result = "";
-    for await (const chunk of stream) result += chunk.content ?? "";
+    const consume = async (
+      msgs: ReadonlyArray<{ role: string; content: string }>,
+    ): Promise<string> => {
+      const stream = model.respond(msgs as never, predictionOptions as never);
+      let out = "";
+      for await (const chunk of stream) out += chunk.content ?? "";
+      return out;
+    };
+
+    let result: string;
+    try {
+      result = await consume(messages);
+    } catch {
+      // Some LM Studio runtimes reject a trailing assistant message (the Qwen
+      // ` thinking` prefill). Retry the same micro-call without it; `/no_think`
+      // in the user message still suppresses reasoning.
+      result = await consume(messages.filter((m) => m.role !== "assistant"));
+    }
     return result.trim().toUpperCase().includes("NO") ? "no" : "yes";
   } catch {
     return "error";

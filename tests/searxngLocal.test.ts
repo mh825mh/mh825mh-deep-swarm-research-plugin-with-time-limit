@@ -8,8 +8,11 @@ import {
   resetSearxLocalStats,
   searxEndpointsFor,
   getSearxLocalStats,
+  isSearxLocalReachable,
+  prioritizeSearxng,
 } from "../src/net/search-engines";
 import { isSsrfAllowed } from "../src/net/http";
+import { SearchHealthTracker } from "../src/swarm/health";
 
 describe("searxEndpointsFor", () => {
   it("uses the configured local endpoint first, then the public one", () => {
@@ -56,6 +59,62 @@ describe("searx local availability state", () => {
     resetSearxLocalStats();
     expect(getSearxLocalStats().configured).toBe(false);
     expect(isSearxLocalKnownUnavailable()).toBe(false);
+  });
+});
+
+describe("prioritizeSearxng", () => {
+  it("promotes searxng to index 0 when it is already in the engine set", () => {
+    expect(prioritizeSearxng(["ddg", "searxng", "bing"], true)).toEqual([
+      "searxng",
+      "ddg",
+      "bing",
+    ]);
+  });
+
+  it("does not inject searxng into layers that did not select it", () => {
+    expect(prioritizeSearxng(["ddg", "bing", "brave"], true)).toEqual([
+      "ddg",
+      "bing",
+      "brave",
+    ]);
+  });
+
+  it("dedupes without moving searxng when it is already first", () => {
+    expect(prioritizeSearxng(["searxng", "ddg", "searxng"], true)).toEqual([
+      "searxng",
+      "ddg",
+    ]);
+  });
+
+  it("preserves the configured order when the local instance is unreachable", () => {
+    expect(prioritizeSearxng(["ddg", "searxng", "bing"], false)).toEqual([
+      "ddg",
+      "searxng",
+      "bing",
+    ]);
+  });
+});
+
+describe("isSearxLocalReachable", () => {
+  it("is true only after a successful probe", async () => {
+    resetSearxLocalStats();
+    expect(isSearxLocalReachable()).toBe(false);
+    await probeSearxLocal("http://127.0.0.1:1");
+    expect(isSearxLocalReachable()).toBe(false);
+  });
+});
+
+describe("SearXNG health accounting", () => {
+  it("updates the first-class searxng block via recordOtherEngineHit", () => {
+    const health = new SearchHealthTracker();
+    health.recordOtherEngineHit("searxng", 3);
+    health.recordOtherEngineHit("searxng", 0);
+
+    expect(health.searxng.searchesAttempted).toBe(2);
+    expect(health.searxng.validResults).toBe(1);
+    expect(health.generateReport()).toContain(
+      "SEARXNG HEALTH\n- State: HEALTHY\n- Searches attempted: 2",
+    );
   });
 });
 

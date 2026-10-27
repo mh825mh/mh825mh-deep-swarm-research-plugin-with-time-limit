@@ -1,6 +1,13 @@
 import { logLlmDiagnostics } from "../utils/tokens";
-import { askLoadedModel, askStructured, ReasoningCapture } from "../utils/llm";
+import {
+  askLoadedModel,
+  askStructured,
+  ReasoningCapture,
+  getLastLlmError,
+  resetLastLlmError,
+} from "../utils/llm";
 import { extractQwenJson } from "../utils/qwen-parser";
+import { buildCoreTopicQuery, capQueryKeywords } from "../utils/topicQuery";
 import { buildKvCachePinnedMessages } from "../swarm/singleflightAndSnippetGate";
 import {
   QueryPlan,
@@ -142,6 +149,7 @@ async function aiDecompose(
   focusAreas: ReadonlyArray<string>,
   status: StatusFn,
   profile: DepthProfile,
+  onLlmSuccess?: () => void,
 ): Promise<{ plan: ResearchPlan | null; reasoning: string }> {
   const prompt = makeDecompositionPrompt(topic, focusAreas, profile);
   const capture: ReasoningCapture = { trace: "" };
@@ -160,6 +168,7 @@ async function aiDecompose(
   if (structured) {
     const plan = researchPlanFromParsed(structured);
     if (plan.workers.length >= DECOMPOSITION_MIN_WORKERS) {
+      onLlmSuccess?.();
       status(
         `AI decomposed topic into ${plan.workers.length} structured workers (tags: ${plan.domainTags.join(", ") || "none"})`,
       );
@@ -177,6 +186,7 @@ async function aiDecompose(
   );
   const reasoning = capture.trace || structuredReasoning;
   if (!raw) return { plan: null, reasoning };
+  onLlmSuccess?.();
   try {
     const parsed = extractQwenJson<any>(raw);
     const list = Array.isArray(parsed) ? parsed : parsed.workers;
@@ -305,12 +315,13 @@ function dimensionFallbackQueries(
   
   for (const dim of dims) {
     for (const q of dim.queries(shortTopic)) {
-      if (!queries.includes(q)) queries.push(q);
+      const capped = capQueryKeywords(q, 10);
+      if (capped && !queries.includes(capped)) queries.push(capped);
     }
   }
   for (const area of focusAreas) {
-    const q = `${shortTopic} ${area}`;
-    if (!queries.includes(q)) queries.push(q);
+    const q = capQueryKeywords(`${shortTopic} ${area}`, 10);
+    if (q && !queries.includes(q)) queries.push(q);
   }
   return queries.slice(0, maxQueries);
 }
@@ -321,7 +332,9 @@ export async function buildQueryPlan(
   useAI: boolean,
   status: StatusFn,
   profile: DepthProfile,
+  onLlmSuccess?: () => void,
 ): Promise<QueryPlan> {
+  resetLastLlmError();
   const CORE_ROLES: ReadonlyArray<WorkerRole> = [
     "breadth",
     "depth",
@@ -352,7 +365,13 @@ export async function buildQueryPlan(
   let plannerReasoning = "";
   if (useAI) {
     status("AI task decomposition - analysing topic for specialised workers...");
-    const decomposition = await aiDecompose(topic, focusAreas, status, profile);
+    const decomposition = await aiDecompose(
+      topic,
+      focusAreas,
+      status,
+      profile,
+      onLlmSuccess,
+    );
     const plan = decomposition.plan;
     plannerReasoning = decomposition.reasoning;
     if (plan && plan.workers.length >= DECOMPOSITION_MIN_WORKERS) {
@@ -380,6 +399,7 @@ export async function buildQueryPlan(
         if (result.status !== "fulfilled") continue;
         const { role, queries: raw } = result.value;
         if (!raw) continue;
+        onLlmSuccess?.();
         const parsed = parseLines(raw, profile.maxQueriesPerWorker);
         if (parsed.length >= AI_MIN_ACCEPTABLE_QUERIES) {
           queriesByRole[role] = parsed;
@@ -392,7 +412,10 @@ export async function buildQueryPlan(
         `AI generated queries for ${Object.keys(queriesByRole).length} worker role(s)`,
       );
     } else {
-      status("AI unavailable, using dimension-based query planning");
+      const reason = getLastLlmError();
+      status(
+        `AI unavailable${reason ? ` (${reason})` : ""}, using dimension-based query planning`,
+      );
     }
   }
   for (const role of roles) {
@@ -609,7 +632,10 @@ Queries:`;
     plans.push({
       role,
       label: `Gap-fill: ${group.dimLabels.slice(0, 3).join(", ")}`,
-      queries: group.queries.slice(0, profile.maxGapFillQueries),
+      queries: group.queries
+        .map((query) => capQueryKeywords(query, 10))
+        .filter(Boolean)
+        .slice(0, profile.maxGapFillQueries),
       followLinks: group.followLinks,
       preferredTiers: group.tiers,
     });
@@ -651,25 +677,14 @@ function shortenTopic(topic: string): string {
   const colonIdx = topic.indexOf(":");
   const dashIdx = topic.indexOf(" - ");
   const sepIdx = colonIdx > 3 ? colonIdx : dashIdx > 3 ? dashIdx : -1;
-  let core: string;
-  if (sepIdx > 3 && sepIdx < topic.length * 0.6) {
-    core = topic.slice(0, sepIdx).trim();
-  } else {
-    core = topic;
-  }
-  const words = core
-    .replace(/[,;()]/g, " ")
-    .split(/\s+/)
-    .filter((w) => w.length > 1 && !STOP_WORDS.has(w.toLowerCase()));
-  let result = "";
-  let count = 0;
-  for (const w of words) {
-    if (count >= 6 || result.length + w.length > 58) break;
-    result += (result ? " " : "") + w;
-    count++;
-  }
-  if (result.length < 5) {
-    result = topic.split(/\s+/).slice(0, 5).join(" ");
-  }
-  return result;
+  const core =
+    sepIdx > 3 && sepIdx < topic.length * 0.6
+      ? topic.slice(0, sepIdx).trim()
+      : topic;
+
+  // buildCoreTopicQuery strips site: operators, framing words, and caps the
+  // keyword count. Keep the fallback short enough that a 1-4 word suffix still
+  // fits inside the 10-keyword ceiling.
+  const cleaned = buildCoreTopicQuery(core, 6);
+  return cleaned.length >= 3 ? cleaned : buildCoreTopicQuery(topic, 6);
 }

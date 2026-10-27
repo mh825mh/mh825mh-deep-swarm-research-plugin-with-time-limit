@@ -10,6 +10,7 @@ import {
   HEURISTIC_HIGH_TIER_SCORE,
   HEURISTIC_MEDIUM_TIER_SCORE,
   HEURISTIC_MIN_KEYWORD_OVERLAP,
+  HEURISTIC_MIN_KEYWORD_OVERLAP_REFERENCE,
   HEURISTIC_MIN_TEXT_LEN,
 } from "../constants";
 
@@ -18,6 +19,16 @@ export interface HeuristicInput {
   readonly title: string;
   readonly text: string;
   readonly query: string;
+  /** Evidence source tier, used for tier-aware overlap thresholds. */
+  readonly sourceTier?: string;
+}
+
+function minOverlapFor(item: HeuristicInput): number {
+  return item.sourceTier === "reference" ||
+    item.sourceTier === "academic" ||
+    item.sourceTier === "government"
+    ? HEURISTIC_MIN_KEYWORD_OVERLAP_REFERENCE
+    : HEURISTIC_MIN_KEYWORD_OVERLAP;
 }
 
 export interface HeuristicResult {
@@ -105,11 +116,12 @@ export function passesHeuristicFilter(item: HeuristicInput): HeuristicResult {
   const tokens = queryTokens(item.query ?? "");
   if (tokens.length > 0) {
     const overlap = overlapRatio(item, tokens);
-    if (overlap < HEURISTIC_MIN_KEYWORD_OVERLAP) {
+    const threshold = minOverlapFor(item);
+    if (overlap < threshold) {
       return {
         pass: false,
         reason: `query overlap ${(overlap * 100).toFixed(0)}% < ${(
-          HEURISTIC_MIN_KEYWORD_OVERLAP * 100
+          threshold * 100
         ).toFixed(0)}%`,
       };
     }

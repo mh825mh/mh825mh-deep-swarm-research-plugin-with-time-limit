@@ -1,5 +1,6 @@
 // src/swarm/singleflightAndSnippetGate.ts
-// Sprint-3 run-shape helpers, all self-contained (no imports):
+// Sprint-3 run-shape helpers (only dependency: the deterministic query hygiene
+// helpers used by selectAdaptiveFallbackDimensions):
 //   1. SingleflightUrlFetcher — guarantees a URL is only ever fetched once
 //      concurrently across all workers (saves FlareSolverr / Decodo quota).
 //   2. shouldFetchSerpCandidate — rejects junk/login-wall results by title +
@@ -9,6 +10,8 @@
 //   4. buildKvCachePinnedMessages — keeps the system prompt byte-identical
 //      across planner / critic / synthesis calls so LM Studio's prefix KV cache
 //      is reused instead of invalidated between sequential calls.
+
+import { buildCoreTopicQuery, capQueryKeywords } from "../utils/topicQuery";
 
 export interface SerpCandidate {
   url: string;
@@ -188,8 +191,12 @@ export function selectAdaptiveFallbackDimensions(
   topic: string,
   maxDimensions = 4,
 ): AdaptiveDimension[] {
-  const clean = topic.trim();
-  const lower = clean.toLowerCase();
+  const fullTopic = topic.trim();
+  const lower = fullTopic.toLowerCase();
+  // Keep the intent classifier on the full topic, but build every deterministic
+  // query from the 3-4 core entity keywords. Passing the whole 25+ word prompt
+  // to DDG/SearXNG produced boolean strings that returned nothing.
+  const core = buildCoreTopicQuery(fullTopic, 4);
 
   const isEmpiricalOrScientific =
     /\b(evidence|study|studies|science|scientific|proof|research|clinical|psychology|history|phenomenon|reincarnation|consciousness|medical)\b/.test(
@@ -208,7 +215,7 @@ export function selectAdaptiveFallbackDimensions(
     {
       id: "dim_overview",
       name: "Overview & Core Mechanisms",
-      queries: [`${clean} overview definition`, `${clean} key concepts explained`],
+      queries: [`${core} overview definition`, `${core} key concepts explained`],
     },
   ];
 
@@ -218,22 +225,22 @@ export function selectAdaptiveFallbackDimensions(
         id: "dim_evidence",
         name: "Research Evidence & Peer-Reviewed Data",
         queries: [
-          `${clean} peer reviewed study empirical data`,
-          `${clean} academic research findings cases`,
+          `${core} peer reviewed study empirical data`,
+          `${core} academic research findings cases`,
         ],
       },
       {
         id: "dim_criticism",
         name: "Methodological Criticism & Counter-Arguments",
         queries: [
-          `${clean} skepticism methodological flaws criticism`,
-          `${clean} alternative explanations scientific consensus`,
+          `${core} skepticism methodological flaws criticism`,
+          `${core} alternative explanations scientific consensus`,
         ],
       },
       {
         id: "dim_history",
         name: "Historical Context & Major Investigations",
-        queries: [`${clean} history major researchers cases`],
+        queries: [`${core} history major researchers cases`],
       },
     );
   } else if (isTechnicalOrSoftware) {
@@ -241,17 +248,17 @@ export function selectAdaptiveFallbackDimensions(
       {
         id: "dim_how_it_works",
         name: "Architecture & Implementation",
-        queries: [`${clean} architecture implementation guide`, `${clean} benchmarks`],
+        queries: [`${core} architecture implementation guide`, `${core} benchmarks`],
       },
       {
         id: "dim_limitations",
         name: "Bottlenecks, Bugs & Edge Cases",
-        queries: [`${clean} common issues limitations troubleshooting`],
+        queries: [`${core} common issues limitations troubleshooting`],
       },
       {
         id: "dim_alternatives",
         name: "Comparisons & Trade-offs",
-        queries: [`${clean} vs alternatives comparison`],
+        queries: [`${core} vs alternatives comparison`],
       },
     );
   } else if (isMarketOrBusiness) {
@@ -259,17 +266,17 @@ export function selectAdaptiveFallbackDimensions(
       {
         id: "dim_economics",
         name: "Economics, Pricing & Legal Structure",
-        queries: [`${clean} cost pricing structure regulations`],
+        queries: [`${core} cost pricing structure regulations`],
       },
       {
         id: "dim_comparisons",
         name: "Competitors & Alternatives",
-        queries: [`${clean} comparison pros cons`],
+        queries: [`${core} comparison pros cons`],
       },
       {
         id: "dim_risks",
         name: "Compliance & Operational Risks",
-        queries: [`${clean} risks requirements compliance`],
+        queries: [`${core} risks requirements compliance`],
       },
     );
   } else {
@@ -277,22 +284,27 @@ export function selectAdaptiveFallbackDimensions(
       {
         id: "dim_evidence",
         name: "Key Evidence & Primary Sources",
-        queries: [`${clean} primary sources evidence analysis`],
+        queries: [`${core} primary sources evidence analysis`],
       },
       {
         id: "dim_perspectives",
         name: "Expert Analysis & Competing Views",
-        queries: [`${clean} expert analysis debate controversy`],
+        queries: [`${core} expert analysis debate controversy`],
       },
       {
         id: "dim_developments",
         name: "Current State & Recent Developments",
-        queries: [`${clean} recent developments 2025 2026`],
+        queries: [`${core} recent developments updates`],
       },
     );
   }
 
-  return selected.slice(0, maxDimensions);
+  return selected
+    .map((dimension) => ({
+      ...dimension,
+      queries: dimension.queries.map((query) => capQueryKeywords(query, 10)),
+    }))
+    .slice(0, maxDimensions);
 }
 
 /**

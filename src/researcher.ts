@@ -150,6 +150,8 @@ function buildRunFooter(
     `DDG state: ${stats.ddgState}`,
     `DDG searches attempted: ${stats.ddgQueries}`,
     `DDG blocks/challenges: ${stats.ddgBlocks}`,
+    `SearXNG searches attempted: ${stats.searxngQueries}`,
+    `SearXNG valid results: ${stats.searxngValidResults}`,
     "",
     "## 🤖 LLM Watchdog",
     `LLM calls used: ${stats.llmCallsUsed} / ${stats.llmCallBudget}`,
