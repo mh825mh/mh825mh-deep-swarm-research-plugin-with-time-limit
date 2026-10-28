@@ -11,6 +11,8 @@ import {
   MIN_CANDIDATE_SCORE,
   MIN_URL_QUALITY,
   LINK_KEYWORD_BONUS,
+  MAX_PAGES_PER_HOST_PER_WORKER,
+  MAX_PAGES_PER_HOST_GLOBAL,
 } from "../constants";
 import { ScoredCandidate, SearchHit, SourceTier, Outlink } from "../types";
 import { getDomainAdjustments } from "../swarm/learning";
@@ -151,6 +153,28 @@ const URL_BONUSES: ReadonlyArray<readonly [RegExp, number]> = [
   [/\/news\//i, 6],
   [/\/blog\/\d{4}/i, 8],
 ];
+
+const ALWAYS_ALLOWED_DOMAIN_RE =
+  /(^|\.)wikipedia\.org$|(^|\.)openalex\.org$/i;
+
+/**
+ * Domain-diversity gate used before a page is accepted. Wikipedia/OpenAlex are
+ * reference infrastructure and exempt; every other host is capped at 2 pages
+ * per worker and 3 pages globally.
+ */
+export function canAcceptDomain(
+  host: string,
+  workerCount: number,
+  globalCount: number,
+  taskDomainCap: number = Number.POSITIVE_INFINITY,
+): boolean {
+  const normalized = host.toLowerCase().replace(/^www\./i, "");
+  if (ALWAYS_ALLOWED_DOMAIN_RE.test(normalized)) return true;
+  return (
+    workerCount < MAX_PAGES_PER_HOST_PER_WORKER &&
+    globalCount < Math.min(MAX_PAGES_PER_HOST_GLOBAL, taskDomainCap)
+  );
+}
 
 export function scoreCandidate(hit: SearchHit, query: string): ScoredCandidate {
   const hostname = safeHostname(hit.url);

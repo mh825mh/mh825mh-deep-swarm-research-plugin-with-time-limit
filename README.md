@@ -5,12 +5,12 @@ searches your local documents and the web, adapts its strategy, verifies claims,
 and synthesizes everything into a structured, confidence-scored report with
 auditable citations — all in one tool call.
 
-[![Version](https://img.shields.io/badge/version-5.11.0-blue)]()
+[![Version](https://img.shields.io/badge/version-5.12.0-blue)]()
 [![License](https://img.shields.io/badge/license-MIT-green)]()
 [![Node](https://img.shields.io/badge/runtime-Node.js-orange)]()
 [![Platform](https://img.shields.io/badge/platform-LM Studio-blue)]()
 
-- Version: **5.11.0**
+- Version: **5.12.0**
 - Runtime: local-first (no cloud required)
 - History: see [`CHANGELOG.md`](./CHANGELOG.md)
 
@@ -23,6 +23,33 @@ auditable citations — all in one tool call.
 
 > **Qwen 3.8 fast-call mode:** Optimized for Qwen-class models, this mode pre-fills an empty reasoning block and appends `/no_think` to prevent truncation of short verdicts, enabling faster reasoning calls without losing detailed traces.
 
+> **New in 5.12.0:** a reliability-focused release for long local runs.
+>
+> - **AI workers are respected:** standard depth now caps the plan at 5 active
+>   workers x 2 queries, uses the AI-decomposed workers instead of expanding
+>   into hardcoded SaaS/product roles, and strips commercial boilerplate from
+>   non-commercial topics.
+> - **Local SearXNG is faster and safer:** JSON-first parsing (`format=json`),
+>   a 12s per-query timeout, max 2 concurrent local requests, and no 10-minute
+>   cooldown when a query legitimately returns 0 results.
+> - **Layers stop when the job is done:** after SearXNG, the swarm exits the
+>   layer loop once it has 12 web sources or 75% of workers have >=2 sources;
+>   workers already at 50% of their budget are not re-run in DIRECT/API.
+> - **Source diversity:** max 2 pages per host per worker and 3 per host across
+>   the run (Wikipedia/OpenAlex exempt), standard-depth link following is capped
+>   at depth 1 and only runs below 4 direct sources.
+> - **Realistic relevance:** `rel` scores now combine core-term overlap (0.6)
+>   with query/dimension overlap (0.4) and cap at 0.92 instead of clamping to
+>   1.00.
+> - **Fetch and Feeds guards:** FlareSolverr is skipped for `web.archive.org`,
+>   `archive.org`, `sciencedirect.com`, and `researchgate.net`; Sciencedirect /
+>   ResearchGate fail fast. The Feeds pass is skipped immediately when no real
+>   RSS/Telegram targets are configured.
+> - **Critic retry hygiene:** failed-card metadata (`[OpenAlex ...]`, `Title:`,
+>   `Abstract:`) is stripped and retry queries are capped at 10 keywords.
+> - **Plugin-safe LLM client:** reuses the authenticated controller client
+>   instead of constructing `new LMStudioClient()` inside the plugin context.
+>
 > **New in 5.11.0:** the SearXNG engine now defaults to a **local instance**
 > (`http://127.0.0.1:8080`, configurable via the `SearXNG URL` setting). The
 > endpoint is probed at run start — if your local SearXNG is unreachable the run

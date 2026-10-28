@@ -2,20 +2,20 @@ import { runWorker, CrawlMetrics, urlSingleflight } from "./worker";
 import { SwarmBlackboard } from "./blackboard";
 import { topicNeedsLocalSources } from "../local/gatekeeper";
 import { extractUncertaintyQueries, filterNovelQueries, shouldMineUncertainty } from "./uncertainty-miner";
-import {
-  buildQueryPlan,
-  buildAdaptiveGapFill,
-  summariseFindings,
-} from "../planning/planner";
-import { detectCoveredDimensions, DIMENSIONS, detectGaps } from "../planning/dimensions";
+import { buildQueryPlan, summariseFindings } from "../planning/planner";
 import { seedFromTierZeroJsonApis } from "../net/tierZeroJsonSeeder";
 import { InRunQueryTracker } from "../net/queryCache";
-import { selectAdaptiveFallbackDimensions } from "./singleflightAndSnippetGate";
+import {
+  selectAdaptiveFallbackDimensions,
+  shouldExitLayersAfterSearxng,
+  workerNeedsAnotherLayer,
+} from "./singleflightAndSnippetGate";
 import { resolveSkillPackWithFallback } from "../utils/qwenOptimizer";
 import { loadSkillPack } from "../skills/loader";
 import {
   ResearchConfig,
   SwarmTask,
+  DynamicWorkerSpec,
   WorkerResult,
   CrawledSource,
   WorkerRole,
@@ -29,7 +29,17 @@ import {
   SkillPack,
   BlockedUrlEntry,
 } from "../types";
-import { DepthProfile, CRITIC_RETRY_MAX_TASKS, CRITIC_RETRY_PAGE_BUDGET, UNCERTAINTY_MAX_QUERIES, UNCERTAINTY_PAGE_BUDGET, FALLBACK_CORE_DIMENSIONS } from "../constants";
+import {
+  DepthProfile,
+  CRITIC_RETRY_MAX_TASKS,
+  CRITIC_RETRY_PAGE_BUDGET,
+  UNCERTAINTY_MAX_QUERIES,
+  UNCERTAINTY_PAGE_BUDGET,
+  FALLBACK_CORE_DIMENSIONS,
+  STANDARD_MAX_GAP_QUERIES,
+  STANDARD_MAX_GAP_WORKERS,
+  LAYER_COVERAGE_MIN_SOURCES_PER_WORKER,
+} from "../constants";
 import { DdgLimiterPool, resetThrottle } from "../net/ddg";
 import { resetArchiveSession, getArchiveState } from "../net/http";
 import { VisitedPageCache, normalizeUrl, type VisitedCacheStats } from "./visited-cache";
@@ -159,7 +169,7 @@ function zeroMetrics(): CrawlMetrics {
     mutationHits: 0, extraEngineQueries: 0, extraEngineHits: 0, rawHits: 0,
     dedupedHits: 0, rankedCandidates: 0, fetchCandidates: 0, fetchAttempts: 0,
     fetchFailures: 0, acceptedSources: 0, skippedLowWordCount: 0, skippedOffTopic: 0,
-    skippedSnippetGate: 0, skippedVeryOffTopic: 0, skippedDuplicateContent: 0, skippedVisited: 0,
+    skippedSnippetGate: 0, snippetGateForcedAdmits: 0, skippedVeryOffTopic: 0, skippedDuplicateContent: 0, skippedVisited: 0,
     skippedDomainCap: 0, skippedAvoided: 0, skippedBlacklisted: 0, skippedNegativeCache: 0,
     cacheChecks: 0,
     cacheHits: 0, cacheAccepted: 0, cacheRejectedDuplicate: 0, cacheRejectedOffTopic: 0,
@@ -401,7 +411,9 @@ function buildTaskBase(
     maxOutlinksPerPage: profile.maxOutlinksPerPage,
     searchPages: profile.searchPages,
     extraEngines: getEnginesForRole("breadth", cfg, cfg.engineSelectionMode ?? "adaptive"),
-    linkCrawlDepth: profile.linkCrawlDepth,
+    // Standard/shallow runs never spider deeper than one level.
+    linkCrawlDepth:
+      profile.depthRounds <= 3 ? 1 : profile.linkCrawlDepth,
     queryMutationThreshold: profile.queryMutationThreshold,
     extractPagesPerSource: profile.extractPagesPerSource,
     evidenceExcerptChars:
@@ -489,6 +501,40 @@ function buildRound1Tasks(
   return round1Tasks;
 }
 
+/**
+ * Builds one task per AI-decomposed worker instead of expanding into the
+ * hardcoded role matrix. Queries are already capped by the planner; slice again
+ * defensively so an older plan cannot reintroduce 4-query workers.
+ */
+function buildDynamicTasks(
+  specs: ReadonlyArray<DynamicWorkerSpec>,
+  profile: DepthProfile,
+  cfg: ResearchConfig,
+): SwarmTask[] {
+  const maxWorkers =
+    profile.depthRounds <= 3
+      ? Math.min(STANDARD_MAX_GAP_WORKERS, profile.maxDecompositionWorkers)
+      : profile.maxDecompositionWorkers;
+  const maxQueries =
+    profile.depthRounds <= 3
+      ? Math.min(STANDARD_MAX_GAP_QUERIES, profile.maxQueriesPerWorker)
+      : profile.maxQueriesPerWorker;
+
+  const tasks: SwarmTask[] = [];
+  for (const [index, spec] of specs.slice(0, maxWorkers).entries()) {
+    const queries = spec.queries.slice(0, maxQueries);
+    if (queries.length === 0) continue;
+    const task = buildStaticTask(spec.role, queries, profile, cfg, index);
+    tasks.push({
+      ...task,
+      label: spec.label || task.label,
+      followLinks: cfg.enableLinkFollowing && spec.followLinks,
+      preferredTiers: spec.preferredTiers ?? task.preferredTiers,
+    });
+  }
+  return tasks;
+}
+
 function buildGapTasks(
   gapPlans: ReadonlyArray<GapPlanLike>,
   round: number,
@@ -518,6 +564,21 @@ function buildGapTasks(
     });
   }
   return tasks;
+}
+
+/** Blank/whitespace entries must not trigger the expensive live Feeds pass. */
+function sanitizeFeedList(values?: ReadonlyArray<string>): string[] {
+  return (values ?? []).map((value) => value.trim()).filter(Boolean);
+}
+
+function usableRssFeedUrls(values?: ReadonlyArray<string>): string[] {
+  return sanitizeFeedList(values).filter((value) => /^https?:\/\//i.test(value));
+}
+
+function usableTelegramChannels(values?: ReadonlyArray<string>): string[] {
+  return sanitizeFeedList(values).filter((value) =>
+    /^(?:@[\w_]+|(?:https?:\/\/)?(?:t|telegram)\.me\/)/i.test(value),
+  );
 }
 
 interface TaskGroupScope {
@@ -800,6 +861,8 @@ export async function runSwarm(
     .filter((s) => Boolean(s && s.trim().length > 0))
     .join("\n\n");
   const roles = rolesForProfile(profile);
+  const aiWorkers =
+    plan.usedAI && plan.dynamicSpecs?.length ? plan.dynamicSpecs : undefined;
   const pool = new DdgLimiterPool(profile.searchLanes, profile.ddgRateLimitMs);
 
   // item 8: auto-select a skill pack from the planner's domain tags and apply
@@ -875,7 +938,9 @@ export async function runSwarm(
 
   if (shouldSearchLocal) {
     fileStatus(`\n📚 LAYER 1: Searching Local RAG Libraries...`);
-    const localTasks = buildRound1Tasks(roles, plan.queriesByRole, profile, cfg);
+    const localTasks = aiWorkers
+      ? buildDynamicTasks(aiWorkers, profile, cfg)
+      : buildRound1Tasks(roles, plan.queriesByRole, profile, cfg);
     const localOnlyTasks = localTasks.map(t => ({ ...t, extraEngines: [] as ReadonlyArray<string> }));
     const localResults = await runTaskGroup(localOnlyTasks, state, pool, signal, fileStatus, fileWarn, plan.topicKeywords, health, llmManager);
     aggregateResults(localResults, allSources, allQueries, allErrors);
@@ -930,24 +995,30 @@ export async function runSwarm(
     }
   }
 
-  const coveredIds = detectCoveredDimensions(allSources.map(s => s.text));
-
-  // Deterministic fallback (item 3): when the LLM planner was unavailable,
-  // replace the blind 12-dimension dump with the topic-adaptive top-N
-  // dimensions, then let the LLM-planned runs use the full uncovered set.
-  const allGaps = detectGaps(coveredIds);
-  const fallbackDims = plan.usedAI
+  // Use the AI-decomposed workers as the authoritative gap plan. The old code
+  // ignored plan.dynamicSpecs and expanded to all 12 hardcoded DIMENSIONS,
+  // which introduced Applications/Challenges/Economics boilerplate.
+  const fallbackDims = aiWorkers?.length
     ? []
     : selectAdaptiveFallbackDimensions(cfg.topic, FALLBACK_CORE_DIMENSIONS);
-  if (!plan.usedAI) {
+  if (!aiWorkers?.length) {
     fileStatus(
       `[PLAN] Deterministic fallback: topic-adaptive plan (${fallbackDims.length} dimension(s): ${fallbackDims.map(d => d.name).join(" | ")}).`,
     );
   }
 
-  const recordedGaps: ReadonlyArray<{ id: string; label: string }> = plan.usedAI
-    ? allGaps.map(g => ({ id: g.id, label: g.label }))
-    : fallbackDims.map(d => ({ id: d.id, label: d.name }));
+  const aiQueryCap =
+    profile.depthRounds <= 3
+      ? Math.min(STANDARD_MAX_GAP_QUERIES, profile.maxQueriesPerWorker)
+      : profile.maxQueriesPerWorker;
+
+  const recordedGaps: ReadonlyArray<{ id: string; label: string }> =
+    aiWorkers?.length
+      ? aiWorkers.map((worker, index) => ({
+          id: `ai-worker-${index + 1}`,
+          label: worker.label,
+        }))
+      : fallbackDims.map((d) => ({ id: d.id, label: d.name }));
 
   for (const gap of recordedGaps) {
     if (signal.aborted) break;
@@ -964,14 +1035,14 @@ export async function runSwarm(
     });
   }
 
-  const gapPlanInputs: ReadonlyArray<GapPlanLike> = plan.usedAI
-    ? allGaps.map(g => ({
-        role: "breadth" as WorkerRole,
-        label: `Gap: ${g.label}`,
-        queries: g.queries(cfg.topic),
-        followLinks: true,
+  const gapPlanInputs: ReadonlyArray<GapPlanLike> = aiWorkers?.length
+    ? aiWorkers.map((worker) => ({
+        role: worker.role,
+        label: `AI Worker: ${worker.label}`,
+        queries: worker.queries.slice(0, aiQueryCap),
+        followLinks: worker.followLinks,
       }))
-    : fallbackDims.map(d => ({
+    : fallbackDims.map((d) => ({
         role: "breadth" as WorkerRole,
         label: `Gap: ${d.name}`,
         queries: d.queries,
@@ -1004,21 +1075,23 @@ export async function runSwarm(
     if (typeof hardStopTimer.unref === "function") hardStopTimer.unref();
   }
 
-  // Dedicated feeds pass: when RSS feeds / Telegram channels are configured,
-  // query them once for the topic (plus the top planned queries) instead of
-  // adding them to every worker's engine set. The sibling-plugin cache bridge
-  // (telegram-rag-cache / rss-rag-cache) seeds first so a cache hit skips the
-  // network entirely, and the live pass is hard-capped at 12s so it can never
-  // stall long enough to trip the 2-minute watchdog.
-  if (
+  // Dedicated feeds pass: only when real RSS/Telegram entries are configured.
+  // Blank strings used to trigger the full 12s live pass with no actual feeds.
+  const configuredRssFeedUrls = usableRssFeedUrls(cfg.rssFeedUrls);
+  const configuredTelegramChannels = usableTelegramChannels(cfg.telegramChannels);
+  const hasConfiguredFeeds =
+    configuredRssFeedUrls.length > 0 || configuredTelegramChannels.length > 0;
+
+  if (!hasConfiguredFeeds) {
+    fileStatus("[Feeds] No RSS/Telegram feeds configured - skipping pass.");
+  } else if (
     !signal.aborted &&
     !llmManager.signal.aborted &&
-    Date.now() < crawlDeadline &&
-    (cfg.rssFeedUrls?.length || cfg.telegramChannels?.length)
+    Date.now() < crawlDeadline
   ) {
     const feedEngines: string[] = [];
-    if (cfg.rssFeedUrls && cfg.rssFeedUrls.length > 0) feedEngines.push("rss");
-    if (cfg.telegramChannels && cfg.telegramChannels.length > 0) feedEngines.push("telegram");
+    if (configuredRssFeedUrls.length > 0) feedEngines.push("rss");
+    if (configuredTelegramChannels.length > 0) feedEngines.push("telegram");
 
     const plannedQueries = Object.values(plan.queriesByRole)
       .flatMap((qs) => qs ?? [])
@@ -1049,6 +1122,8 @@ export async function runSwarm(
         ...buildStaticTask("breadth", feedQueries, profile, cfg),
         label: "Feeds",
         extraEngines: feedEngines,
+        rssFeedUrls: configuredRssFeedUrls,
+        telegramChannels: configuredTelegramChannels,
       };
       // Isolate the Feeds pass: it gets its own abort scope and runs WITHOUT
       // the LLM stall watchdog. The 12s timeout resolves with [] but the
@@ -1099,6 +1174,11 @@ export async function runSwarm(
   const layerSequence = localSearxReachable
     ? ["SEARXNG", "DIRECT", "API"]
     : ["DDG", "SEARXNG", "DIRECT", "API"];
+  const acceptedByTask = new Map<string, number>();
+  // Tier-0/feeds are already accepted web sources before the engine layers run.
+  let externalAcceptedSources = allSources.filter(
+    (source) => source.origin === "web",
+  ).length;
 
   for (const layer of layerSequence) {
     const budgetExpired = Date.now() >= crawlDeadline;
@@ -1157,13 +1237,40 @@ export async function runSwarm(
 
     if (layerEngines.length === 0) continue;
 
-    fileStatus(`\n🔍 Executing Layer: ${layer} (${layerEngines.join(", ")})`);
-    const layerTasks = externalTasks.map(t => ({ ...t, extraEngines: layerEngines }));
+    // Workers that already hit 50% of their page budget in an earlier layer
+    // do not need another full layer of searching.
+    const layerTasks = externalTasks
+      .map((t) => ({ ...t, extraEngines: layerEngines }))
+      .filter((t) =>
+        workerNeedsAnotherLayer(
+          acceptedByTask.get(t.id) ?? 0,
+          t.pageBudget,
+        ),
+      );
+
+    if (layerTasks.length === 0) {
+      fileStatus(
+        `[LAYER SKIP] ${layer}: all workers already met 50% of their page budget.`,
+      );
+      continue;
+    }
+
+    fileStatus(
+      `\n🔍 Executing Layer: ${layer} (${layerEngines.join(", ")}) for ${layerTasks.length}/${externalTasks.length} worker(s)`,
+    );
     const layerResults = await runTaskGroup(layerTasks, state, pool, signal, fileStatus, fileWarn, plan.topicKeywords, health, llmManager);
     
     const prevSourceCount = allSources.length;
     aggregateResults(layerResults, allSources, allQueries, allErrors);
     const newSources = allSources.length - prevSourceCount;
+    externalAcceptedSources += newSources;
+
+    for (const result of layerResults) {
+      acceptedByTask.set(
+        result.taskId,
+        (acceptedByTask.get(result.taskId) ?? 0) + result.sources.length,
+      );
+    }
 
     // Mark gaps resolved for the report whenever a layer contributed sources,
     // but do NOT clear the task list: later layers still get to run so we
@@ -1171,6 +1278,32 @@ export async function runSwarm(
     if (newSources > 0) {
       health.gaps.forEach(g => { g.resolved = true; });
     }
+
+    const acceptedPerWorker = externalTasks.map(
+      (t) => acceptedByTask.get(t.id) ?? 0,
+    );
+    const coveredWorkers = acceptedPerWorker.filter(
+      (count) => count >= LAYER_COVERAGE_MIN_SOURCES_PER_WORKER,
+    ).length;
+    const coverage =
+      acceptedPerWorker.length > 0
+        ? coveredWorkers / acceptedPerWorker.length
+        : 1;
+
+    if (
+      layer === "SEARXNG" &&
+      shouldExitLayersAfterSearxng(
+        externalAcceptedSources,
+        acceptedPerWorker,
+      )
+    ) {
+      fileStatus(
+        `[LAYER EXIT] SEARXNG satisfied coverage (${externalAcceptedSources} source(s), ` +
+          `${Math.round(coverage * 100)}% of workers with 2+) — skipping DIRECT/API.`,
+      );
+      break;
+    }
+
     if (layer === "API") health.apiCallsMade++;
   }
 

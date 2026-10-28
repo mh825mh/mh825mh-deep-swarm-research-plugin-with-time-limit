@@ -5,6 +5,7 @@ import { buildBrowserHeaders, fetchLocalAllowed, fetchPage } from "./http";
 import { fetchWithWaterfall, isFlareSolverrKnownUnreachable } from "./waterfallFetcher";
 import { fetchViaDecodo, isDecodoConfigured } from "./decodoApi";
 import { globalEnginePacer, ENGINE_PACE_MIN_INTERVAL_MS } from "../swarm/pluginBridgeAndPacer";
+import { SEARXNG_MAX_CONCURRENCY, SEARXNG_QUERY_TIMEOUT_MS } from "../constants";
 import { searchRssFeeds } from "./rss-engine";
 import { searchTelegram } from "./social-engines";
 import {
@@ -113,6 +114,43 @@ function parseSearchLinks(html: string, source: string, maxResults: number): Rea
   return hits;
 }
 
+/**
+ * Parse a SearXNG `format=json` response. Returns `null` when the payload is not
+ * usable JSON so the caller can fall back to HTML parsing; an empty array is a
+ * valid "200 OK but no results" response.
+ */
+export function parseSearxJson(
+  raw: string,
+  maxResults: number,
+): ReadonlyArray<SearchHit> | null {
+  try {
+    const data = JSON.parse(raw) as {
+      results?: Array<{
+        url?: string;
+        title?: string;
+        content?: string;
+        snippet?: string;
+      }>;
+    };
+    if (!Array.isArray(data?.results)) return null;
+
+    const hits: SearchHit[] = [];
+    for (const result of data.results) {
+      const url = typeof result.url === "string" ? result.url.trim() : "";
+      if (!url.startsWith("http")) continue;
+      hits.push({
+        url,
+        title: (result.title ?? url).trim() || url,
+        snippet: (result.content ?? result.snippet ?? "").trim(),
+        discoveredBy: "searxng",
+      });
+    }
+    return dedupeHits(hits, maxResults);
+  } catch {
+    return null;
+  }
+}
+
 // Serialized queue to prevent concurrent hits and ban patterns
 class EngineQueue {
   private chain: Promise<any> = Promise.resolve();
@@ -139,6 +177,41 @@ class EngineQueue {
     return runTask;
   }
 }
+
+/**
+ * Small FIFO semaphore used to cap concurrent requests to the local SearXNG
+ * instance. The old per-engine serialized queue allowed 9 workers to queue up
+ * behind each other until the 30s multi-engine cap fired.
+ */
+class AsyncSemaphore {
+  private active = 0;
+  private readonly waiters: Array<() => void> = [];
+
+  constructor(private readonly max: number) {}
+
+  async acquire(): Promise<() => void> {
+    if (this.active < this.max) {
+      this.active++;
+      return this.releaseFn();
+    }
+    await new Promise<void>((resolve) => this.waiters.push(resolve));
+    this.active++;
+    return this.releaseFn();
+  }
+
+  private releaseFn(): () => void {
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.active = Math.max(0, this.active - 1);
+      const next = this.waiters.shift();
+      if (next) next();
+    };
+  }
+}
+
+const searxLocalSemaphore = new AsyncSemaphore(SEARXNG_MAX_CONCURRENCY);
 
 const engineQueues: Record<string, EngineQueue> = {
   ddg: new EngineQueue(4000),
@@ -346,25 +419,57 @@ export async function probeSearxLocal(rawBase: string, signal?: AbortSignal): Pr
   }
 }
 
-/** Local SearXNG search: fast, direct fetch via the engine queue. No retry /
- * backoff / Wayback tiers — a dead local instance fails fast so the caller can
- * fall through to the public instance. */
-async function searchSearxLocal(url: string, maxResults: number, signal: AbortSignal, allowBase: string): Promise<ReadonlyArray<SearchHit>> {
+/**
+ * Local SearXNG search. Tries `format=json` first (reliable url/title/content),
+ * then falls back to HTML only when JSON is blocked or unparseable. Concurrency
+ * is capped so nine workers cannot queue behind each other for 30 seconds.
+ */
+async function searchSearxLocal(
+  query: string,
+  maxResults: number,
+  signal: AbortSignal,
+  base: string,
+): Promise<ReadonlyArray<SearchHit> | null> {
   if (signal.aborted) throw new DOMException("Aborted", "AbortError");
-  const queue = engineQueues["searxng"] || new EngineQueue(4000);
-  return queue.run(async () => {
-    try {
-      const response = await fetchLocalAllowed(url, signal, [allowBase]);
-      return parseSearchLinks(response.html, "searxng", maxResults);
-    } catch (error: unknown) {
-      if (error instanceof DOMException && error.name === "AbortError") throw error;
-      const msg = error instanceof Error ? error.message : String(error);
-      // Mark the local tier dead for the rest of the run (the pre-flight probe
-      // normally catches this, but an instance can die mid-run).
-      setSearxLocal(false, msg);
-      return [];
+
+  const startedAt = Date.now();
+  const release = await searxLocalSemaphore.acquire();
+  try {
+    // Drop work that waited too long for a slot; the caller's 12s cap has
+    // already elapsed, so completing now would only waste the instance.
+    if (Date.now() - startedAt > SEARXNG_QUERY_TIMEOUT_MS) return [];
+
+    const q = encodeURIComponent(query);
+    const jsonUrl = `${base}/search?q=${q}&format=json`;
+    const jsonRes = await fetchLocalAllowed(jsonUrl, signal, [base]);
+    const jsonStatus = jsonRes.statusCode ?? 0;
+
+    if (jsonStatus === 200) {
+      const parsed = parseSearxJson(jsonRes.html, maxResults);
+      // A valid 200 JSON response (including `[]`) is authoritative. Only
+      // unparseable JSON falls through to the HTML endpoint.
+      if (parsed !== null) return parsed;
     }
-  });
+
+    if ([200, 400, 403, 404].includes(jsonStatus)) {
+      const htmlRes = await fetchLocalAllowed(
+        `${base}/search?q=${q}&format=html`,
+        signal,
+        [base],
+      );
+      return parseSearchLinks(htmlRes.html, "searxng", maxResults);
+    }
+
+    return null;
+  } catch (error: unknown) {
+    if (error instanceof DOMException && error.name === "AbortError") throw error;
+    const msg = error instanceof Error ? error.message : String(error);
+    // Connection-level failure: the local tier really is unavailable.
+    setSearxLocal(false, msg);
+    return null;
+  } finally {
+    release();
+  }
 }
 
 async function searchSearxng(query: string, maxResults: number, signal: AbortSignal, flaresolverrUrl?: string, searxngUrl?: string): Promise<ReadonlyArray<SearchHit>> {
@@ -380,19 +485,19 @@ async function searchSearxng(query: string, maxResults: number, signal: AbortSig
       }
       continue;
     }
-    const allow = local ? normalizeSearxBase(searxngUrl ?? DEFAULT_SEARXNG_LOCAL_URL) : undefined;
-    const hits = local
-      ? await searchSearxLocal(url, maxResults, signal, allow!)
-      : await searchHtmlEndpoint(url, "searxng", maxResults, signal, flaresolverrUrl);
-    if (hits.length > 0) return hits;
-    if (local && !isSearxLocalKnownUnavailable()) {
-      // Local instance is up but returned no parseable results — fall through
-      // to the public instance for this query without permanently disabling
-      // the local tier.
-      console.warn(
-        `[searxng] Local instance returned no results — falling back to public ${PUBLIC_SEARXNG_URL}.`,
-      );
+    if (local) {
+      const allow = normalizeSearxBase(searxngUrl ?? DEFAULT_SEARXNG_LOCAL_URL);
+      const localHits = await searchSearxLocal(query, maxResults, signal, allow);
+      // A valid local 2xx response is authoritative — including `[]`. A narrow
+      // query returning zero local hits must not trigger a second public-SearXNG
+      // request (that is what doubled the load in the logs).
+      if (localHits !== null) return localHits;
+      warnedLocalUnavailable = true;
+      continue;
     }
+
+    const hits = await searchHtmlEndpoint(url, "searxng", maxResults, signal, flaresolverrUrl);
+    if (hits.length > 0) return hits;
     warnedLocalUnavailable = true;
   }
   return [];
@@ -613,14 +718,15 @@ export async function multiEngineSearch(
   limiterFactory: LimiterFactory = () => new DdgRateLimiter(4000),
   timeRange = "all",
   options: SearchEngineOptions = {},
+  timeoutMs: number = MULTI_ENGINE_CAP_MS,
 ): Promise<ReadonlyArray<SearchHit>> {
   if (signal.aborted) throw new DOMException("Aborted", "AbortError");
 
   let capTimer: NodeJS.Timeout | null = null;
   const cap = new Promise<never>((_, reject) => {
     capTimer = setTimeout(
-      () => reject(new Error(`Engine search cap exceeded (${MULTI_ENGINE_CAP_MS}ms) for "${query.slice(0, 60)}"`)),
-      MULTI_ENGINE_CAP_MS,
+      () => reject(new Error(`Engine search cap exceeded (${timeoutMs}ms) for "${query.slice(0, 60)}"`)),
+      timeoutMs,
     );
     if (typeof capTimer.unref === "function") capTimer.unref();
   });
@@ -670,9 +776,10 @@ async function multiEngineSearchInner(
           case "google": return searchGoogle(query, perEngineLimit, signal, options.flaresolverrUrl);
           case "scholar": return searchGoogleScholar(query, perEngineLimit, signal, options.flaresolverrUrl);
           case "searxng":
-            return globalEnginePacer.schedule("searxng", ENGINE_PACE_MIN_INTERVAL_MS, () =>
-              searchSearxng(query, perEngineLimit, signal, options.flaresolverrUrl, options.searxngUrl),
-            );
+            // Concurrency is capped inside searchSearxLocal by a 2-slot
+            // semaphore. Wrapping this in the serialized pacer defeated that
+            // cap and caused 30s queue timeouts across nine workers.
+            return searchSearxng(query, perEngineLimit, signal, options.flaresolverrUrl, options.searxngUrl);
           case "mojeek": return searchMojeek(query, perEngineLimit, signal, options.flaresolverrUrl);
           case "yandex": return searchYandex(query, perEngineLimit, signal, options.flaresolverrUrl);
           case "youtube": return searchYouTube(query, perEngineLimit, signal);

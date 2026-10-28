@@ -4,6 +4,40 @@ All notable changes to `lms-plugin-deep-swarm-research`, newest first. See `READ
 
 ---
 
+## What's New in v5.12.0?
+
+Reliability and runtime-cost release for long local research runs.
+
+* **AI-decomposed worker plan is authoritative:** standard depth is capped at
+  5 workers x 2 queries, hardcoded SaaS/product role expansion is skipped when
+  Qwen supplies worker specs, and non-commercial topics no longer receive
+  `pricing`, `ROI`, `market size`, `barriers to adoption`, `practical
+  deployment`, or `who invented` suffixes. Every deterministic/worker query is
+  capped at 8 keywords.
+* **Layer short-circuiting:** workers already at 50% of their page budget are
+  skipped in later layers; after SearXNG the run exits DIRECT/API once the swarm
+  has 12 accepted web sources or 75% of workers have >=2 sources.
+* **Source diversity:** max 2 pages per host per worker and 3 per host globally
+  (Wikipedia/OpenAlex exempt). Standard-depth link following is depth 1 and only
+  runs when direct results are below 4 sources.
+* **Relevance distribution:** `computeRelevance` now blends core-topic overlap
+  (0-0.6) with full-query/dimension overlap (0-0.4) and caps at 0.92 instead of
+  clamping every accepted source to 1.00.
+* **SearXNG hardening:** JSON endpoint first, 12s per-query cap, 2 concurrent
+  local requests, dedupe `(engine, query)` per run, and no health cooldown for a
+  valid 200-OK empty result.
+* **Fetch guards:** FlareSolverr bypasses `web.archive.org`, `archive.org`,
+  `sciencedirect.com`, and `researchgate.net`; Sciencedirect/ResearchGate fail
+  fast instead of burning a 20s timeout.
+* **Feeds fast-skip:** absent/blank RSS and Telegram configs skip the Feeds
+  stage immediately.
+* **Critic retry hygiene:** card metadata tags and `Abstract:` dumps are stripped
+  before retry queries are issued (max 10 keywords).
+* **Plugin LLM client:** `getLlmClient()` reuses the authenticated controller
+  client, with planner calls now counted in the LLM budget.
+
+---
+
 ## 🚀 What's New in v5.10.0?
 
 Latency, zero-source resilience, and KV-cache efficiency for local Qwen-class

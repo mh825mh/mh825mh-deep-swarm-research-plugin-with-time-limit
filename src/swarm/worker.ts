@@ -1,7 +1,10 @@
 // src/swarm/worker.ts
 import { LlmCallManager, askLoadedModel, hasLoadedModel } from "../utils/llm";
 import { logLlmDiagnostics } from "../utils/tokens";
-import { fetchWithWaterfall } from "../net/waterfallFetcher";
+import {
+  fetchWithWaterfall,
+  isFastFailFetchHost,
+} from "../net/waterfallFetcher";
 import {
   isYouTubeUrl,
   extractYouTubeTranscript,
@@ -30,7 +33,11 @@ import {
   SearchEngine,
 } from "../net/search-engines";
 import { globalEnginePacer, ENGINE_PACE_MIN_INTERVAL_MS } from "./pluginBridgeAndPacer";
-import { SingleflightUrlFetcher, shouldFetchSerpCandidate } from "./singleflightAndSnippetGate";
+import {
+  SingleflightUrlFetcher,
+  rescueTopCandidates,
+  shouldFetchSerpCandidate,
+} from "./singleflightAndSnippetGate";
 import { optimizeForQwen38 } from "../utils/qwenOptimizer";
 import { SearchHealthTracker } from "./health";
 import { fetchPage, sleep, maybeArchivePage } from "../net/http";
@@ -44,7 +51,12 @@ import {
   isPdfContentType,
   extractPdf,
 } from "../net/pdf-extractor";
-import { scoreCandidate, rankCandidates, scoreOutlinks } from "../scoring/authority";
+import {
+  canAcceptDomain,
+  scoreCandidate,
+  rankCandidates,
+  scoreOutlinks,
+} from "../scoring/authority";
 import {
   buildDomainPolicyFromTask,
   urlAllowed,
@@ -66,8 +78,12 @@ import {
   BATCH_INTER_FETCH_DELAY_MS,
   MIN_USEFUL_WORD_COUNT,
   EXTRA_ENGINE_MAX_RESULTS,
+  SEARXNG_QUERY_TIMEOUT_MS,
+  MAX_PAGES_PER_HOST_GLOBAL,
+  MAX_LINK_FOLLOW_SOURCES_STANDARD,
 } from "../constants";
 import { normalizeUrl } from "./visited-cache";
+import { buildCoreTopicQuery } from "../utils/topicQuery";
 import { getEngineStats, getMutationStats, getDomainAdjustments } from "./learning";
 
 /**
@@ -98,6 +114,7 @@ export interface CrawlMetrics {
   skippedLowWordCount: number;
   skippedOffTopic: number;
   skippedSnippetGate: number;
+  snippetGateForcedAdmits: number;
   skippedVeryOffTopic: number;
   skippedDuplicateContent: number;
   skippedVisited: number;
@@ -186,6 +203,7 @@ function zeroMetrics(): CrawlMetrics {
     dedupedHits: 0, rankedCandidates: 0, fetchCandidates: 0, fetchAttempts: 0,
     fetchFailures: 0, acceptedSources: 0, skippedLowWordCount: 0, skippedOffTopic: 0,
     skippedSnippetGate: 0,
+    snippetGateForcedAdmits: 0,
     skippedVeryOffTopic: 0, skippedDuplicateContent: 0, skippedVisited: 0, skippedDomainCap: 0,
     skippedAvoided: 0, skippedBlacklisted: 0, skippedNegativeCache: 0, cacheChecks: 0, cacheHits: 0, cacheAccepted: 0,
     cacheRejectedDuplicate: 0, cacheRejectedOffTopic: 0, cacheRejectedLowWordCount: 0,
@@ -231,6 +249,7 @@ export async function runWorker(
   }
 
   const allHits: SearchHitLike[] = [];
+  const acceptedDomains = new Map<string, number>();
   let ddgBlocked = false;
 
   const searchOptions = {
@@ -274,9 +293,16 @@ export async function runWorker(
         () => limiter,
         task.timeRange ?? "all",
         searchOptions,
+        SEARXNG_QUERY_TIMEOUT_MS,
       );
       metrics.extraEngineHits += hits.length;
-      health.recordOtherEngineHit("searxng", hits.length);
+      if (hits.length > 0) {
+        health.recordOtherEngineHit("searxng", hits.length);
+      } else {
+        // A 200 OK with zero results means the query was too narrow. It is not
+        // an engine outage and must not trigger the 10-minute cooldown.
+        health.recordOtherEngineEmpty("searxng");
+      }
       if (task.enableAdaptiveLearning !== false) getEngineStats().record("searxng", hits.length);
       llmManager.recordProgress();
       return hits;
@@ -381,7 +407,10 @@ export async function runWorker(
         if (isAbortError(err)) break;
         const msg = errorMessage(err);
         health.recordDdgFailure(msg);
-        warn(`${roleTag} DDG failed (${health.ddg.consecutiveFailures}/5): ${msg}`);
+        if (msg.includes("DDG_RATE_LIMITED") || msg.includes("202")) {
+          ddgBlocked = true;
+        }
+        warn(`${roleTag} DDG failed (${health.ddg.consecutiveFailures}/2): ${msg}`);
         llmManager.recordProgress(); // A capped, completed search attempt is not a hang.
         
         // Massive exponential backoff penalty if a block is detected (10-15 seconds)
@@ -502,6 +531,7 @@ export async function runWorker(
           const usableEngines = (task.extraEngines as ReadonlyArray<SearchEngine>).filter(
             (engine) =>
               !enginesTried.has(engine) &&
+              (engine !== "ddg" || health.isDdgAvailable()) &&
               (!trackedEngines.has(engine) || health.isOtherEngineAvailable(engine)) &&
               state.claimEngineQuery(engine, bestMutation!.query),
           );
@@ -521,7 +551,11 @@ export async function runWorker(
               for (const engine of usableEngines) {
                 if (!trackedEngines.has(engine)) continue;
                 const engineHits = mutExtraHits.filter((h) => h.discoveredBy === engine).length;
-                health.recordOtherEngineHit(engine, engineHits);
+                if (engine === "searxng" && engineHits === 0) {
+                  health.recordOtherEngineEmpty(engine);
+                } else {
+                  health.recordOtherEngineHit(engine, engineHits);
+                }
                 if (task.enableAdaptiveLearning !== false) getEngineStats().record(engine, engineHits);
               }
             } catch {}
@@ -545,6 +579,7 @@ export async function runWorker(
         const usableEngines = (task.extraEngines as ReadonlyArray<SearchEngine>).filter(
           (engine) =>
             !enginesTried.has(engine) &&
+            (engine !== "ddg" || health.isDdgAvailable()) &&
             (!trackedEngines.has(engine) || health.isOtherEngineAvailable(engine)) &&
             state.claimEngineQuery(engine, query),
         );
@@ -589,7 +624,11 @@ export async function runWorker(
           for (const engine of usableEngines) {
             if (!trackedEngines.has(engine)) continue;
             const engineHits = extraHits.filter((h) => h.discoveredBy === engine).length;
-            health.recordOtherEngineHit(engine, engineHits);
+            if (engine === "searxng" && engineHits === 0) {
+              health.recordOtherEngineEmpty(engine);
+            } else {
+              health.recordOtherEngineHit(engine, engineHits);
+            }
             if (task.enableAdaptiveLearning !== false) getEngineStats().record(engine, engineHits);
           }
         }
@@ -616,21 +655,38 @@ export async function runWorker(
   const filtered = task.preferredTiers ? scored.filter((c) => task.preferredTiers!.includes(c.tier)) : scored;
   const poolSize = task.pageBudget * task.candidatePoolMultiplier;
   const ranked = rankCandidates(filtered.length > 0 ? filtered : scored, poolSize);
-  const candidates = capCandidatesPerHost(ranked, 2);
+  // Never let the score floor turn a healthy SERP into zero fetch candidates:
+  // keep the top 3 by search rank as a floor.
+  const candidates = capCandidatesPerHost(
+    ranked.length > 0 ? ranked : scored.slice(0, 3),
+    2,
+  );
 
   metrics.rankedCandidates = candidates.length;
   metrics.fetchCandidates = candidates.length;
 
-  await fetchBatch(candidates, task, state, signal, status, warn, sources, errors, roleTag, topicKws, metrics, llmManager);
-  
-  if (task.followLinks && sources.length > 0 && sources.length < task.pageBudget) {
-    for (let depth = 1; depth <= task.linkCrawlDepth; depth++) {
+  await fetchBatch(candidates, task, state, signal, status, warn, sources, errors, roleTag, topicKws, metrics, llmManager, true, acceptedDomains);
+
+  // Standard/shallow runs are capped at one link level and only spider when the
+  // direct SERP fetch under-delivered. Depth-2 spidering is what filled a
+  // worker's budget with the same domain over and over.
+  const standardLinkPolicy = task.linkCrawlDepth <= 1;
+  const maxLinkDepth = task.linkCrawlDepth;
+  const linkFollowCeiling = standardLinkPolicy
+    ? Math.min(MAX_LINK_FOLLOW_SOURCES_STANDARD, task.pageBudget)
+    : task.pageBudget;
+  if (
+    task.followLinks &&
+    sources.length > 0 &&
+    sources.length < linkFollowCeiling
+  ) {
+    for (let depth = 1; depth <= maxLinkDepth; depth++) {
       if (sources.length >= task.pageBudget || signal.aborted) break;
       const budget = Math.min(task.pageBudget - sources.length, task.maxLinksToFollow);
       if (budget <= 0) break;
 
       const sourcesForLinks = depth === 1 ? sources : sources.slice(-budget * 2);
-      const newCount = await followLinks(sourcesForLinks, task, state, signal, status, warn, sources, errors, roleTag, budget, topicKws, depth, metrics, llmManager);
+      const newCount = await followLinks(sourcesForLinks, task, state, signal, status, warn, sources, errors, roleTag, budget, topicKws, depth, metrics, llmManager, acceptedDomains);
       metrics.followedLinks += newCount;
       if (newCount === 0) break;
     }
@@ -663,13 +719,25 @@ async function fetchBatch(
   metrics: CrawlMetrics,
   llmManager: LlmCallManager,
   applySnippetGate: boolean = true,
+  acceptedDomains: Map<string, number> = new Map(),
 ): Promise<void> {
   let idx = 0;
   const concurrency = task.workerConcurrency;
-  const domainCap = task.maxPagesPerDomain;
+  const globalDomainCap = Math.min(
+    MAX_PAGES_PER_HOST_GLOBAL,
+    task.maxPagesPerDomain,
+  );
   const minRelevance = task.minRelevanceScore;
   const domainPolicy = buildDomainPolicyFromTask(task);
-  const gateTopic = task.queries.join(" ");
+  // Score the pre-fetch gate against the core 4-5 topic terms, never the full
+  // mutated/dimension-suffixed query.
+  const gateTopic = buildCoreTopicQuery(
+    topicKws.length > 0 ? topicKws.join(" ") : (task.queries[0] ?? ""),
+    5,
+  );
+  const snippetRejected: ScoredCandidate[] = [];
+  let gateAdmitted = 0;
+  let forcedAdmits = 0;
 
   while (results.length < task.pageBudget && idx < candidates.length && !signal.aborted) {
     const slice = candidates.slice(idx, idx + concurrency);
@@ -681,7 +749,18 @@ async function fetchBatch(
       if (!policy.allowed) { metrics.skippedDomainPolicy++; continue; }
       const normalized = normalizeUrl(c.url);
       if (state.visitedUrls.has(normalized)) { metrics.skippedVisited++; continue; }
-      if (state.domainCount(c.url) >= domainCap) { metrics.skippedDomainCap++; continue; }
+      const host = safeHostname(c.url);
+      if (
+        !canAcceptDomain(
+          host,
+          acceptedDomains.get(host) ?? 0,
+          state.domainCount(c.url),
+          globalDomainCap,
+        )
+      ) {
+        metrics.skippedDomainCap++;
+        continue;
+      }
       if (state.shouldAvoidUrl(c.url)) { metrics.skippedAvoided++; continue; }
       if (state.isDomainBlacklisted(c.url)) { metrics.skippedBlacklisted++; continue; }
       if (state.isRejected(c.url)) { metrics.skippedNegativeCache++; continue; }
@@ -694,9 +773,33 @@ async function fetchBatch(
           gateTopic,
           task.label,
         );
-        if (!gate.allow) { metrics.skippedSnippetGate++; continue; }
+        if (!gate.allow) {
+          metrics.skippedSnippetGate++;
+          if (gate.reason !== "low_value_url_pattern") snippetRejected.push(c);
+          continue;
+        }
       }
+      gateAdmitted++;
       batch.push(c);
+    }
+
+    if (batch.length === 0 && gateAdmitted === 0 && forcedAdmits < 3) {
+      // Guarantee progress: if the gate rejected every valid URL, admit the
+      // top-ranked 3 (total, not per batch) rather than letting a worker
+      // finish with 0 fetched pages.
+      const rescued = rescueTopCandidates(
+        snippetRejected.splice(0),
+        candidates.length,
+        3 - forcedAdmits,
+      );
+      if (rescued.length > 0) {
+        forcedAdmits += rescued.length;
+        metrics.snippetGateForcedAdmits += rescued.length;
+        batch.push(...rescued);
+        warn(
+          `${tag} Snippet gate rejected all candidates; force-admitting top ${rescued.length} by search rank.`,
+        );
+      }
     }
 
     if (batch.length === 0) continue;
@@ -736,6 +839,11 @@ async function fetchBatch(
       if (state.contentHashes.has(fp)) { metrics.skippedDuplicateContent++; if (fromCache) metrics.cacheRejectedDuplicate++; continue; }
 
       state.addHash(fp);
+      const acceptedHost = safeHostname(candidate.url);
+      acceptedDomains.set(
+        acceptedHost,
+        (acceptedDomains.get(acceptedHost) ?? 0) + 1,
+      );
       state.incrementDomain(candidate.url);
 
       if (fromCache) {
@@ -794,7 +902,13 @@ function adaptCachedSourceForTask(
   topicKws: ReadonlyArray<string>,
 ): CrawledSource {
   const { domainScore, freshnessScore, tier } = scoreCandidate({ url: cached.url, title: cached.title, snippet: cached.description }, query);
-  const relevanceScore = computeRelevance(cached.text, cached.title, snippet, topicKws);
+  const relevanceScore = computeRelevance(
+    cached.text,
+    cached.title,
+    snippet,
+    topicKws,
+    query,
+  );
   return {
     ...cached,
     url: normalizeUrl(cached.url),
@@ -823,7 +937,8 @@ async function followLinks(
   topicKws: ReadonlyArray<string>,
   depth: number,
   metrics: CrawlMetrics,
-  llmManager: LlmCallManager
+  llmManager: LlmCallManager,
+  acceptedDomains: Map<string, number>,
 ): Promise<number> {
   const allLinks = existingSources.flatMap((s) => s.outlinks);
   const linkKws = task.queries.join(" ").toLowerCase().split(/\s+/).filter((w) => w.length > 3).slice(0, 12);
@@ -841,7 +956,22 @@ async function followLinks(
   const before = results.length;
   const linkCandidates = toFollow.map((l) => scoreCandidate({ url: l.href, title: "", snippet: "" }, task.queries[0] ?? ""));
 
-  await fetchBatch(linkCandidates, { ...task, pageBudget: results.length + budget }, state, signal, status, warn, results, errors, tag, topicKws, metrics, llmManager, false);
+  await fetchBatch(
+    linkCandidates,
+    { ...task, pageBudget: results.length + budget },
+    state,
+    signal,
+    status,
+    warn,
+    results,
+    errors,
+    tag,
+    topicKws,
+    metrics,
+    llmManager,
+    false,
+    acceptedDomains,
+  );
 
   return results.length - before;
 }
@@ -920,7 +1050,13 @@ async function fetchAndExtract(
   }
 
   const { domainScore, freshnessScore, tier } = scoreCandidate({ url, title: page.title, snippet: page.description }, query);
-  const relevanceScore = computeRelevance(page.text, page.title, snippet, topicKws);
+  const relevanceScore = computeRelevance(
+    page.text,
+    page.title,
+    snippet,
+    topicKws,
+    query,
+  );
 
   return {
     url: normalizeUrl(page.url),
@@ -980,6 +1116,13 @@ async function fetchWithWaybackFallback(
   signal: AbortSignal,
   task: SwarmTask,
 ): Promise<Awaited<ReturnType<typeof fetchPage>>> {
+  if (isFastFailFetchHost(url)) {
+    // Sciencedirect/ResearchGate guarantee a FlareSolverr HTTP 500 (Turnstile)
+    // after ~20s. Fail immediately and let the SERP/seed evidence stand.
+    throw new Error(
+      "Blocked/unsolvable host: skipped before FlareSolverr timeout",
+    );
+  }
   try {
     // TIER 1: Standard Fetch (keeps raw PDF buffer support)
     return await fetchPage(url, signal);

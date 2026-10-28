@@ -9,10 +9,63 @@ import {
   shouldFetchSerpCandidate,
   selectAdaptiveFallbackDimensions,
   buildKvCachePinnedMessages,
+  rescueTopCandidates,
+  workerNeedsAnotherLayer,
+  shouldExitLayersAfterSearxng,
 } from "../src/swarm/singleflightAndSnippetGate";
 import { seedFromTierZeroJsonApis } from "../src/net/tierZeroJsonSeeder";
-import { buildQueryPlan } from "../src/planning/planner";
+import {
+  buildQueryPlan,
+  capDynamicWorkerQueries,
+} from "../src/planning/planner";
 import { getDepthProfile } from "../src/constants";
+import { canAcceptDomain } from "../src/scoring/authority";
+
+describe("layer short-circuit policy", () => {
+  it("does not re-run a worker that already has 50% of its budget", () => {
+    expect(workerNeedsAnotherLayer(4, 8)).toBe(false);
+    expect(workerNeedsAnotherLayer(5, 8)).toBe(false);
+    expect(workerNeedsAnotherLayer(3, 8)).toBe(true);
+  });
+
+  it("exits after SearXNG once 12 sources exist", () => {
+    expect(shouldExitLayersAfterSearxng(12, [1, 1, 1, 1])).toBe(true);
+  });
+
+  it("exits when 75% of workers have at least 2 sources", () => {
+    expect(shouldExitLayersAfterSearxng(5, [2, 2, 2, 1])).toBe(true);
+    expect(shouldExitLayersAfterSearxng(4, [1, 1, 1, 1])).toBe(false);
+  });
+});
+
+describe("per-domain acceptance caps", () => {
+  it("admits at most 2 pages from the same host per worker", () => {
+    const workerCounts = new Map<string, number>();
+    const accepted: number[] = [];
+
+    for (let page = 1; page <= 5; page++) {
+      const host = "example.com";
+      if (
+        canAcceptDomain(host, workerCounts.get(host) ?? 0, 0, 4)
+      ) {
+        workerCounts.set(host, (workerCounts.get(host) ?? 0) + 1);
+        accepted.push(page);
+      }
+    }
+
+    expect(accepted).toEqual([1, 2]);
+  });
+
+  it("enforces the 3-page global cap for ordinary hosts", () => {
+    expect(canAcceptDomain("example.com", 0, 2, 4)).toBe(true);
+    expect(canAcceptDomain("example.com", 0, 3, 4)).toBe(false);
+  });
+
+  it("exempts wikipedia and openalex from the cap", () => {
+    expect(canAcceptDomain("en.wikipedia.org", 99, 99, 4)).toBe(true);
+    expect(canAcceptDomain("api.openalex.org", 99, 99, 4)).toBe(true);
+  });
+});
 
 describe("optimizeForQwen38", () => {
   it("suppresses reasoning on micro-calls with prefill + /no_think", () => {
@@ -146,6 +199,31 @@ describe("shouldFetchSerpCandidate", () => {
   });
 });
 
+describe("snippet gate rescue", () => {
+  it("admits the top 3 rejected candidates when a search had at least 3 hits", () => {
+    const rejected = Array.from({ length: 12 }, (_, i) => i + 1);
+    expect(rescueTopCandidates(rejected, 12)).toEqual([1, 2, 3]);
+  });
+
+  it("does not force-admit when fewer than 3 candidates were returned", () => {
+    expect(rescueTopCandidates([1, 2], 2)).toEqual([]);
+  });
+
+  it("accepts a short-snippet core-topic hit at the lowered threshold", () => {
+    const gate = shouldFetchSerpCandidate(
+      {
+        url: "https://en.wikipedia.org/wiki/Antichrist",
+        title: "Antichrist",
+        snippet: "",
+        engine: "searxng",
+      },
+      "antichrist fathers",
+      "Gap: Applications",
+    );
+    expect(gate.allow).toBe(true);
+  });
+});
+
 describe("selectAdaptiveFallbackDimensions", () => {
   it("caps to the requested dimension count", () => {
     expect(selectAdaptiveFallbackDimensions("x", 2)).toHaveLength(2);
@@ -183,7 +261,10 @@ describe("selectAdaptiveFallbackDimensions", () => {
 });
 
 describe("deterministic planner query hygiene", () => {
-  it("caps fallback queries at 10 keywords without years or site operators", async () => {
+  const SAAS_TERMS =
+    /\b(roi|pricing|market size|economic impact|barriers to adoption|who invented|practical deployment|implementation case studies)\b/i;
+
+  it("caps fallback queries at 8 keywords without years/site/SaaS terms", async () => {
     const topic =
       "What are the core mechanisms, evidence, and primary sources of the " +
       "Orthodox Church Fathers' theology of deification (theosis) according to tradition?";
@@ -198,9 +279,60 @@ describe("deterministic planner query hygiene", () => {
 
     expect(queries.length).toBeGreaterThan(0);
     for (const q of queries) {
-      expect(q.split(/\s+/).filter(Boolean).length).toBeLessThanOrEqual(10);
+      expect(q.split(/\s+/).filter(Boolean).length).toBeLessThanOrEqual(8);
       expect(q).not.toMatch(/\bsite:/);
       expect(q).not.toMatch(/\b2025\b|\b2026\b/);
+      expect(q).not.toMatch(SAAS_TERMS);
+    }
+  });
+
+  it("keeps the Orthodox/pastoral Antichrist topic free of SaaS boilerplate", async () => {
+    const topic =
+      "Antichrist characteristics traits according to Holy Fathers and " +
+      "Orthodox tradition patristic writings";
+    const plan = await buildQueryPlan(
+      topic,
+      [],
+      false,
+      () => {},
+      getDepthProfile("standard"),
+    );
+    const queries = Object.values(plan.queriesByRole).flatMap((qs) => qs ?? []);
+
+    expect(queries.length).toBeGreaterThan(0);
+    for (const q of queries) {
+      expect(q.split(/\s+/).filter(Boolean).length).toBeLessThanOrEqual(8);
+      expect(q).not.toMatch(SAAS_TERMS);
+    }
+  });
+
+  it("caps AI-decomposed workers and queries", () => {
+    const specs = Array.from({ length: 9 }, (_, i) => ({
+      role: "breadth" as const,
+      label: `Worker ${i + 1}`,
+      queries: [
+        "antichrist fathers orthodox tradition",
+        "pricing economics ROI",
+        "barriers to adoption",
+      ],
+      budgetWeight: 0.2,
+      followLinks: false,
+    }));
+
+    const capped = capDynamicWorkerQueries(
+      specs,
+      5,
+      2,
+      "Antichrist characteristics traits according to Holy Fathers and Orthodox tradition",
+    );
+
+    expect(capped).toHaveLength(5);
+    for (const worker of capped) {
+      expect(worker.queries.length).toBeLessThanOrEqual(2);
+      for (const q of worker.queries) {
+        expect(q.split(/\s+/).filter(Boolean).length).toBeLessThanOrEqual(8);
+        expect(q).not.toMatch(SAAS_TERMS);
+      }
     }
   });
 });

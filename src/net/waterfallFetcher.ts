@@ -29,6 +29,40 @@ export interface FlareSolverrStats {
   failures: number;
 }
 
+/**
+ * Hosts that are known-unsolvable through FlareSolverr (Cloudflare Turnstile,
+ * container-level connection refusal, or archive recursion). Sending them to
+ * the 15s endpoint guarantees an HTTP 500 and wastes 19-23s per URL.
+ */
+const FLARE_SOLVERR_SKIP_HOSTS = [
+  "web.archive.org",
+  "archive.org",
+  "sciencedirect.com",
+  "researchgate.net",
+];
+
+/** Hosts we fail fast on rather than trying direct + FlareSolverr + Archive. */
+const FAST_FAIL_FETCH_HOSTS = ["sciencedirect.com", "researchgate.net"];
+
+function hostMatches(url: string, suffixes: ReadonlyArray<string>): boolean {
+  try {
+    const host = new URL(url).hostname.replace(/^www\./i, "").toLowerCase();
+    return suffixes.some(
+      (suffix) => host === suffix || host.endsWith(`.${suffix}`),
+    );
+  } catch {
+    return false;
+  }
+}
+
+export function shouldBypassFlareSolverr(url: string): boolean {
+  return hostMatches(url, FLARE_SOLVERR_SKIP_HOSTS);
+}
+
+export function isFastFailFetchHost(url: string): boolean {
+  return hostMatches(url, FAST_FAIL_FETCH_HOSTS);
+}
+
 const fsStats: FlareSolverrStats = {
   configured: false,
   probed: false,
@@ -223,7 +257,12 @@ export async function fetchWithWaterfall(
   // Gated on the run-start probe: when the endpoint is known-unreachable, the
   // whole tier is skipped so an unreachable FlareSolverr never executes dozens
   // of doomed per-URL attempts (or trips its own timeouts).
-  if (flaresolverrUrl && flaresolverrUrl.trim() !== '' && !isFlareSolverrKnownUnreachable()) {
+  if (
+    flaresolverrUrl &&
+    flaresolverrUrl.trim() !== '' &&
+    !isFlareSolverrKnownUnreachable() &&
+    !shouldBypassFlareSolverr(url)
+  ) {
     fsStats.configured = true;
     // One-time liveness verification: if a run-start probe never succeeded,
     // don't waste per-fetch time dialing a dead endpoint.
@@ -276,6 +315,10 @@ export async function fetchWithWaterfall(
   // TIER C: Wayback Machine (Archive.org Fallback)
   // ==========================================
   try {
+    if (shouldBypassFlareSolverr(url)) {
+      console.warn(`[Tier C] Skipping Wayback for unsolvable/archive host ${url}.`);
+      return null;
+    }
     console.log(`[Tier C] Fetching snapshot for ${url} from Web Archive...`);
     const archiveUrl = `https://web.archive.org/web/2/${url}`;
     const archiveResponse = await fetch(archiveUrl, { signal: abortSignal });

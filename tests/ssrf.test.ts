@@ -1,5 +1,9 @@
 import { describe, it, expect } from "vitest";
 import { isPrivateIp, isPrivateUrl, isDnsRisky } from "../src/net/ssrf";
+import {
+  isFastFailFetchHost,
+  shouldBypassFlareSolverr,
+} from "../src/net/waterfallFetcher";
 
 describe("isPrivateIp", () => {
   it("detects RFC1918 private IPv4 addresses", () => {
@@ -70,5 +74,28 @@ describe("isDnsRisky", () => {
   it("fails closed on malformed URLs", async () => {
     expect(await isDnsRisky("")).toBe(true);
     expect(await isDnsRisky("not-a-url")).toBe(true);
+  });
+});
+
+describe("FlareSolverr host guards", () => {
+  it("bypasses FlareSolverr for archive and unsolvable publishers", () => {
+    expect(
+      shouldBypassFlareSolverr("https://web.archive.org/web/2/https://x.test/a"),
+    ).toBe(true);
+    expect(shouldBypassFlareSolverr("https://archive.org/details/x")).toBe(true);
+    expect(
+      shouldBypassFlareSolverr("https://www.sciencedirect.com/science/article/abs/pii/1"),
+    ).toBe(true);
+    expect(shouldBypassFlareSolverr("https://www.researchgate.net/publication/1")).toBe(true);
+  });
+
+  it("still allows FlareSolverr for ordinary blocked hosts", () => {
+    expect(shouldBypassFlareSolverr("https://example.com/article")).toBe(false);
+  });
+
+  it("fails fast on Sciencedirect/ResearchGate before the waterfall", () => {
+    expect(isFastFailFetchHost("https://www.sciencedirect.com/science/article/abs/pii/1")).toBe(true);
+    expect(isFastFailFetchHost("https://www.researchgate.net/publication/1")).toBe(true);
+    expect(isFastFailFetchHost("https://example.com/article")).toBe(false);
   });
 });

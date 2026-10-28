@@ -40,6 +40,9 @@ import {
   DECOMPOSITION_MIN_WORKERS,
   QUERY_LINE_MIN_LEN,
   QUERY_LINE_MAX_LEN,
+  MAX_GENERATED_QUERY_WORDS,
+  STANDARD_MAX_GAP_QUERIES,
+  STANDARD_MAX_GAP_WORKERS,
   SYSTEM_INSTRUCTIONS,
   THINKING_PROTOCOL,
 } from "../constants";
@@ -300,6 +303,48 @@ const ROLE_DIMENSIONS: Readonly<Record<WorkerRole, ReadonlyArray<string>>> = {
   comparative: ["comparison", "challenges", "applications"],
 };
 
+const COMMERCIAL_TOPIC_RE =
+  /\b(market|pricing|price|revenue|competitor|valuation|saas|stock|finance|financial|business|startup|b2b|roi|cost|buyout|industry|commerce|ecommerce|monetization|sales)\b/i;
+
+const SAAS_QUERY_RE =
+  /\b(roi|pricing|market size|economic impact|barriers to adoption|practical deployment|implementation case studies|who invented|market growth|revenue forecast|financial impact|use cases industry|competitors|benchmark comparison|industry expert)\b/i;
+
+/** True when the topic or AI domain tags explicitly belong to a commercial/software domain. */
+export function isCommercialTopic(
+  topic: string,
+  domainTags: ReadonlyArray<string> = [],
+): boolean {
+  return COMMERCIAL_TOPIC_RE.test(`${topic} ${domainTags.join(" ")}`);
+}
+
+/**
+ * Standard-depth AI plans must not expand into every hardcoded role or dump
+ * four queries per worker. Cap workers/queries and strip commercial boilerplate
+ * from non-commercial topics.
+ */
+export function capDynamicWorkerQueries(
+  specs: ReadonlyArray<DynamicWorkerSpec>,
+  maxWorkers: number,
+  maxQueries: number,
+  topic: string,
+  domainTags: ReadonlyArray<string> = [],
+): DynamicWorkerSpec[] {
+  const commercial = isCommercialTopic(topic, domainTags);
+  const capped: DynamicWorkerSpec[] = [];
+
+  for (const spec of specs.slice(0, Math.max(1, maxWorkers))) {
+    const queries = spec.queries
+      .map((q) => capQueryKeywords(q, MAX_GENERATED_QUERY_WORDS))
+      .filter(Boolean)
+      .filter((q) => commercial || !SAAS_QUERY_RE.test(q))
+      .slice(0, Math.max(1, maxQueries));
+
+    if (queries.length > 0) capped.push({ ...spec, queries });
+  }
+
+  return capped;
+}
+
 function dimensionFallbackQueries(
   role: WorkerRole,
   topic: string,
@@ -307,21 +352,33 @@ function dimensionFallbackQueries(
   maxQueries: number,
 ): ReadonlyArray<string> {
   const dimIds = ROLE_DIMENSIONS[role];
-  const dims = DIMENSIONS.filter((d) => dimIds.includes(d.id));
+  const commercial = isCommercialTopic(topic);
+  // Applications/economics are SaaS/market boilerplate for a theology or
+  // history topic. Only include them when the topic is explicitly commercial.
+  const dims = DIMENSIONS.filter(
+    (d) =>
+      dimIds.includes(d.id) &&
+      (commercial ||
+        !["applications", "economics", "comparison"].includes(d.id)),
+  );
   const queries: string[] = [];
-  
+
   // BUGFIX: Actually use the shortenTopic function to strip the massive prompt
-  const shortTopic = shortenTopic(topic); 
-  
+  const shortTopic = shortenTopic(topic);
+
   for (const dim of dims) {
     for (const q of dim.queries(shortTopic)) {
-      const capped = capQueryKeywords(q, 10);
-      if (capped && !queries.includes(capped)) queries.push(capped);
+      const capped = capQueryKeywords(q, MAX_GENERATED_QUERY_WORDS);
+      if (!capped || queries.includes(capped)) continue;
+      if (!commercial && SAAS_QUERY_RE.test(capped)) continue;
+      queries.push(capped);
     }
   }
   for (const area of focusAreas) {
-    const q = capQueryKeywords(`${shortTopic} ${area}`, 10);
-    if (q && !queries.includes(q)) queries.push(q);
+    const q = capQueryKeywords(`${shortTopic} ${area}`, MAX_GENERATED_QUERY_WORDS);
+    if (!q || queries.includes(q)) continue;
+    if (!commercial && SAAS_QUERY_RE.test(q)) continue;
+    queries.push(q);
   }
   return queries.slice(0, maxQueries);
 }
@@ -363,6 +420,15 @@ export async function buildQueryPlan(
   let researchPlan: ResearchPlan | undefined;
   let domainTags: ReadonlyArray<string> | undefined;
   let plannerReasoning = "";
+  const standardDepth = profile.depthRounds <= 3;
+  const workerCap = standardDepth
+    ? Math.min(STANDARD_MAX_GAP_WORKERS, profile.maxDecompositionWorkers)
+    : profile.maxDecompositionWorkers;
+  const queryCap = standardDepth
+    ? Math.min(STANDARD_MAX_GAP_QUERIES, profile.maxQueriesPerWorker)
+    : profile.maxQueriesPerWorker;
+  const commercialTopic = isCommercialTopic(topic);
+
   if (useAI) {
     status("AI task decomposition - analysing topic for specialised workers...");
     const decomposition = await aiDecompose(
@@ -375,38 +441,55 @@ export async function buildQueryPlan(
     const plan = decomposition.plan;
     plannerReasoning = decomposition.reasoning;
     if (plan && plan.workers.length >= DECOMPOSITION_MIN_WORKERS) {
-      dynamicSpecs = plan.workers;
-      researchPlan = plan;
-      domainTags = plan.domainTags;
-      usedAI = true;
-      for (const spec of plan.workers) {
-        queriesByRole[spec.role] = spec.queries;
-      }
-    } else {
-      status("AI planning queries for each swarm worker...");
-    }
-    const uncoveredRoles = roles.filter((r) => !queriesByRole[r]?.length);
-    if (uncoveredRoles.length > 0) {
-      const results = await Promise.allSettled(
-        uncoveredRoles.map(async (role) => ({
-          role,
-          queries: await callLoadedModel(
-            makeRolePlanPrompt(role, topic, focusAreas, profile),
-          ),
-        })),
+      // Respect the AI plan: cap it, strip SaaS boilerplate, and do NOT expand
+      // into hardcoded roles. This is what used to become 9 workers x 4 queries.
+      const capped = capDynamicWorkerQueries(
+        plan.workers,
+        workerCap,
+        queryCap,
+        topic,
+        plan.domainTags,
       );
-      for (const result of results) {
-        if (result.status !== "fulfilled") continue;
-        const { role, queries: raw } = result.value;
-        if (!raw) continue;
-        onLlmSuccess?.();
-        const parsed = parseLines(raw, profile.maxQueriesPerWorker);
-        if (parsed.length >= AI_MIN_ACCEPTABLE_QUERIES) {
-          queriesByRole[role] = parsed;
-          usedAI = true;
+      if (capped.length >= DECOMPOSITION_MIN_WORKERS) {
+        dynamicSpecs = capped;
+        researchPlan = plan;
+        domainTags = plan.domainTags;
+        usedAI = true;
+        for (const spec of capped) {
+          queriesByRole[spec.role] = spec.queries;
         }
       }
     }
+
+    if (!dynamicSpecs) {
+      status("AI planning queries for each swarm worker...");
+      const uncoveredRoles = roles.filter((r) => !queriesByRole[r]?.length);
+      if (uncoveredRoles.length > 0) {
+        const results = await Promise.allSettled(
+          uncoveredRoles.map(async (role) => ({
+            role,
+            queries: await callLoadedModel(
+              makeRolePlanPrompt(role, topic, focusAreas, profile),
+            ),
+          })),
+        );
+        for (const result of results) {
+          if (result.status !== "fulfilled") continue;
+          const { role, queries: raw } = result.value;
+          if (!raw) continue;
+          onLlmSuccess?.();
+          const parsed = parseLines(raw, queryCap)
+            .map((q) => capQueryKeywords(q, MAX_GENERATED_QUERY_WORDS))
+            .filter(Boolean)
+            .filter((q) => commercialTopic || !SAAS_QUERY_RE.test(q));
+          if (parsed.length >= Math.min(AI_MIN_ACCEPTABLE_QUERIES, queryCap)) {
+            queriesByRole[role] = parsed;
+            usedAI = true;
+          }
+        }
+      }
+    }
+
     if (usedAI) {
       status(
         `AI generated queries for ${Object.keys(queriesByRole).length} worker role(s)`,
@@ -418,14 +501,19 @@ export async function buildQueryPlan(
       );
     }
   }
-  for (const role of roles) {
-    if (!queriesByRole[role] || queriesByRole[role]!.length === 0) {
-      queriesByRole[role] = dimensionFallbackQueries(
-        role,
-        topic,
-        focusAreas,
-        profile.maxQueriesPerWorker,
-      );
+
+  // Only synthesize hardcoded-role fallbacks when the AI plan did not supply
+  // worker specs. Otherwise the 4-5 AI workers are the complete worker set.
+  if (!dynamicSpecs) {
+    for (const role of roles) {
+      if (!queriesByRole[role] || queriesByRole[role]!.length === 0) {
+        queriesByRole[role] = dimensionFallbackQueries(
+          role,
+          topic,
+          focusAreas,
+          queryCap,
+        );
+      }
     }
   }
   
@@ -588,7 +676,11 @@ export async function buildAdaptiveGapFill(
     };
     existing.dimIds.push(gap.id);
     existing.dimLabels.push(gap.label);
-    existing.queries.push(...gap.queries(shortTopic));
+    existing.queries.push(
+      ...gap
+        .queries(shortTopic)
+        .filter((q) => isCommercialTopic(topic) || !SAAS_QUERY_RE.test(q)),
+    );
     byRole.set(mapping.role, existing);
   }
   if (useAI) {
@@ -633,8 +725,9 @@ Queries:`;
       role,
       label: `Gap-fill: ${group.dimLabels.slice(0, 3).join(", ")}`,
       queries: group.queries
-        .map((query) => capQueryKeywords(query, 10))
+        .map((query) => capQueryKeywords(query, MAX_GENERATED_QUERY_WORDS))
         .filter(Boolean)
+        .filter((query) => isCommercialTopic(topic) || !SAAS_QUERY_RE.test(query))
         .slice(0, profile.maxGapFillQueries),
       followLinks: group.followLinks,
       preferredTiers: group.tiers,
@@ -685,6 +778,6 @@ function shortenTopic(topic: string): string {
   // buildCoreTopicQuery strips site: operators, framing words, and caps the
   // keyword count. Keep the fallback short enough that a 1-4 word suffix still
   // fits inside the 10-keyword ceiling.
-  const cleaned = buildCoreTopicQuery(core, 6);
-  return cleaned.length >= 3 ? cleaned : buildCoreTopicQuery(topic, 6);
+  const cleaned = buildCoreTopicQuery(core, 5);
+  return cleaned.length >= 3 ? cleaned : buildCoreTopicQuery(topic, 5);
 }

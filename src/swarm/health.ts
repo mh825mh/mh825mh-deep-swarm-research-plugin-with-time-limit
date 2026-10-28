@@ -3,6 +3,10 @@
 import { getFsStats } from "../net/waterfallFetcher";
 import { getSearxLocalStats } from "../net/search-engines";
 import { getDecodoStats } from "../net/decodoApi";
+import {
+  DDG_MAX_CONSECUTIVE_FAILURES,
+  DDG_RATE_LIMIT_COOLDOWN_MS,
+} from "../constants";
 
 export type EngineState = "HEALTHY" | "DEGRADED" | "TEMPORARILY_UNHEALTHY" | "DISABLED";
 
@@ -93,11 +97,20 @@ export class SearchHealthTracker {
 
     if (reason.includes("timeout")) this.ddg.timeouts++;
     if (reason.includes("parser")) this.ddg.parserErrors++;
-    if (reason.includes("rate_limited") || reason.includes("202")) this.ddg.rateLimited++;
+    const rateLimited = /rate_limited|202/i.test(reason);
+    if (rateLimited) this.ddg.rateLimited++;
 
-    if (this.ddg.consecutiveFailures >= 5) {
+    // A 202 rate-limit page is definitive: stop hammering DDG for the rest of
+    // the run instead of letting 12 workers retry it in a row.
+    if (rateLimited) {
       this.ddg.state = "TEMPORARILY_UNHEALTHY";
-      this.ddg.cooldownExpiry = Date.now() + (11 * 60 * 1000);
+      this.ddg.cooldownExpiry = Date.now() + DDG_RATE_LIMIT_COOLDOWN_MS;
+      return;
+    }
+
+    if (this.ddg.consecutiveFailures >= DDG_MAX_CONSECUTIVE_FAILURES) {
+      this.ddg.state = "TEMPORARILY_UNHEALTHY";
+      this.ddg.cooldownExpiry = Date.now() + DDG_RATE_LIMIT_COOLDOWN_MS;
     }
   }
 
@@ -120,15 +133,27 @@ export class SearchHealthTracker {
     return state.state !== "DISABLED";
   }
 
-  public recordOtherEngineHit(engine: string, hitCount: number, reason?: string) {
+  private engineState(engine: string): EngineHealth {
     // SearXNG has its own first-class health block in the report. Point the
-    // otherEngines entry at the same state object so every existing
-    // recordOtherEngineHit("searxng", ...) call updates both views (otherwise
-    // "SEARXNG HEALTH → Searches attempted" stayed at 0 forever).
+    // otherEngines entry at the same state object so every call updates both.
     if (engine === "searxng") {
       this.otherEngines[engine] = this.searxng;
     }
-    const state = (this.otherEngines[engine] = this.otherEngines[engine] ?? this.freshState());
+    return (this.otherEngines[engine] = this.otherEngines[engine] ?? this.freshState());
+  }
+
+  /**
+   * A 200 OK with zero results means the query was too narrow, not that the
+   * engine is down. Count the attempt/empty result but never cooldown.
+   */
+  public recordOtherEngineEmpty(engine: string): void {
+    const state = this.engineState(engine);
+    state.searchesAttempted++;
+    state.emptyResults++;
+  }
+
+  public recordOtherEngineHit(engine: string, hitCount: number, reason?: string) {
+    const state = this.engineState(engine);
     state.searchesAttempted++;
     if (hitCount >= 1) {
       state.validResults++;

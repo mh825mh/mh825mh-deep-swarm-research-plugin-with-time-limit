@@ -12,6 +12,12 @@
 //      is reused instead of invalidated between sequential calls.
 
 import { buildCoreTopicQuery, capQueryKeywords } from "../utils/topicQuery";
+import {
+  LAYER_COVERAGE_MIN_SOURCES_PER_WORKER,
+  LAYER_EARLY_EXIT_COVERAGE_FRACTION,
+  LAYER_EARLY_EXIT_MIN_SOURCES,
+  LAYER_WORKER_BUDGET_FRACTION,
+} from "../constants";
 
 export interface SerpCandidate {
   url: string;
@@ -117,7 +123,7 @@ export function shouldFetchSerpCandidate(
   candidate: SerpCandidate,
   topic: string,
   gapName: string,
-  minTermOverlap = 0.2,
+  minTermOverlap = 0.08,
 ): { allow: boolean; score: number; reason?: string } {
   const urlLower = candidate.url.toLowerCase();
 
@@ -130,9 +136,12 @@ export function shouldFetchSerpCandidate(
     return { allow: false, score: 0, reason: "low_value_url_pattern" };
   }
 
+  // Score against the core topic only. Including the gap label (or a bloated
+  // mutated query) diluted overlap and rejected 100% of valid SERP hits.
+  const termSource = topic.trim() || gapName;
   const topicTerms = Array.from(
     new Set(
-      `${topic} ${gapName}`
+      termSource
         .toLowerCase()
         .split(/[^a-z0-9]+/)
         .filter((t) => t.length > 2 && !STOPWORDS.has(t)),
@@ -148,7 +157,7 @@ export function shouldFetchSerpCandidate(
   }
 
   // Require at least 1 core topic word to appear in the title/snippet
-  const coreTopicTerms = topic
+  const coreTopicTerms = termSource
     .toLowerCase()
     .split(/[^a-z0-9]+/)
     .filter((t) => t.length > 3 && !STOPWORDS.has(t));
@@ -174,6 +183,47 @@ export function shouldFetchSerpCandidate(
     score: Number(finalScore.toFixed(3)),
     reason: finalScore >= minTermOverlap ? undefined : "low_snippet_overlap",
   };
+}
+
+/**
+ * When the snippet gate rejects every candidate, admit the top-ranked URLs so a
+ * worker with valid search hits never finishes with zero fetched pages.
+ */
+export function rescueTopCandidates<T>(
+  rejected: ReadonlyArray<T>,
+  totalCandidates: number,
+  topN = 3,
+): T[] {
+  if (totalCandidates < 3 || rejected.length === 0 || topN <= 0) return [];
+  return rejected.slice(0, topN);
+}
+
+/** True when a worker still needs another layer (it is below 50% of budget). */
+export function workerNeedsAnotherLayer(
+  acceptedSources: number,
+  pageBudget: number,
+  fraction: number = LAYER_WORKER_BUDGET_FRACTION,
+): boolean {
+  return acceptedSources < Math.ceil(Math.max(1, pageBudget) * fraction);
+}
+
+/**
+ * After SearXNG, skip DIRECT/API when the swarm already has 12 sources or when
+ * 75% of gap workers have at least 2 sources each.
+ */
+export function shouldExitLayersAfterSearxng(
+  externalAcceptedSources: number,
+  acceptedPerWorker: ReadonlyArray<number>,
+): boolean {
+  if (externalAcceptedSources >= LAYER_EARLY_EXIT_MIN_SOURCES) return true;
+  if (acceptedPerWorker.length === 0) return false;
+  const covered = acceptedPerWorker.filter(
+    (count) => count >= LAYER_COVERAGE_MIN_SOURCES_PER_WORKER,
+  ).length;
+  return (
+    covered / acceptedPerWorker.length >=
+    LAYER_EARLY_EXIT_COVERAGE_FRACTION
+  );
 }
 
 /**

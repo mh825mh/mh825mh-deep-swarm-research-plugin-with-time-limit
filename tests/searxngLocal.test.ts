@@ -10,6 +10,7 @@ import {
   getSearxLocalStats,
   isSearxLocalReachable,
   prioritizeSearxng,
+  parseSearxJson,
 } from "../src/net/search-engines";
 import { isSsrfAllowed } from "../src/net/http";
 import { SearchHealthTracker } from "../src/swarm/health";
@@ -115,6 +116,65 @@ describe("SearXNG health accounting", () => {
     expect(health.generateReport()).toContain(
       "SEARXNG HEALTH\n- State: HEALTHY\n- Searches attempted: 2",
     );
+  });
+
+  it("keeps searxng HEALTHY after repeated 200-OK empty results", () => {
+    const health = new SearchHealthTracker();
+    health.recordOtherEngineEmpty("searxng");
+    health.recordOtherEngineEmpty("searxng");
+    health.recordOtherEngineEmpty("searxng");
+    health.recordOtherEngineEmpty("searxng");
+
+    expect(health.searxng.state).toBe("HEALTHY");
+    expect(health.searxng.searchesAttempted).toBe(4);
+    expect(health.searxng.emptyResults).toBe(4);
+    expect(health.searxng.consecutiveFailures).toBe(0);
+    expect(health.searxng.blocks).toBe(0);
+  });
+
+  it("circuit-breaks DDG immediately on a 202 rate limit", () => {
+    const health = new SearchHealthTracker();
+    health.recordDdgFailure("DDG_RATE_LIMITED (202)");
+    expect(health.isDdgAvailable()).toBe(false);
+  });
+
+  it("circuit-breaks DDG after two consecutive empty/blocked results", () => {
+    const health = new SearchHealthTracker();
+    health.recordDdgFailure("INVALID_RESULT_SET (0 results)");
+    expect(health.isDdgAvailable()).toBe(true);
+    health.recordDdgFailure("INVALID_RESULT_SET (0 results)");
+    expect(health.isDdgAvailable()).toBe(false);
+  });
+});
+
+describe("parseSearxJson", () => {
+  it("maps structured SearXNG results to SearchHit objects", () => {
+    const hits = parseSearxJson(
+      JSON.stringify({
+        results: [
+          { url: "https://example.com/a", title: "A", content: "Snippet A" },
+          { url: "https://example.com/b", title: "B", snippet: "Snippet B" },
+          { url: "/relative", title: "Ignored" },
+        ],
+      }),
+      10,
+    );
+
+    expect(hits).toHaveLength(2);
+    expect(hits?.[0]).toMatchObject({
+      url: "https://example.com/a",
+      title: "A",
+      snippet: "Snippet A",
+      discoveredBy: "searxng",
+    });
+  });
+
+  it("returns [] for a valid 200 response with no results", () => {
+    expect(parseSearxJson(JSON.stringify({ results: [] }), 10)).toEqual([]);
+  });
+
+  it("returns null for invalid JSON so the caller can fall back to HTML", () => {
+    expect(parseSearxJson("<html>not json</html>", 10)).toBeNull();
   });
 });
 

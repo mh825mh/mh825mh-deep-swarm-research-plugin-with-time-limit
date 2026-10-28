@@ -23,12 +23,12 @@ describe("computeRelevance", () => {
     expect(score).toBe(0);
   });
 
-  it("rejects a page matching fewer than the required keyword fraction", () => {
-    // Two distinctive keywords -> 60% rounded up requires both to match.
+  it("gives partial credit instead of hard-rejecting one of two core terms", () => {
     const text =
       "Reincarnation is a central belief in several religions. Clinical evidence of past lives remains debated.";
     const score = computeRelevance(text, "Belief systems", "", ["reincarnation", "skeptic"]);
-    expect(score).toBe(0);
+    expect(score).toBeGreaterThan(0);
+    expect(score).toBeLessThanOrEqual(0.6);
   });
 
   it("matches a page containing every required keyword", () => {

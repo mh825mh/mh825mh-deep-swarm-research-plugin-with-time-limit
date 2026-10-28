@@ -21,9 +21,6 @@ import {
   FINGERPRINT_HEAD_WORDS,
   FINGERPRINT_MID_WORDS,
   FINGERPRINT_TAIL_WORDS,
-  RELEVANCE_TITLE_BONUS,
-  RELEVANCE_SNIPPET_BONUS,
-  RELEVANCE_KEYWORD_MIN_FRACTION,
 } from "../constants";
 
 const virtualConsole = new VirtualConsole();
@@ -326,37 +323,53 @@ export function contentFingerprint(text: string): string {
   return [...head, ...mid, ...tail].join(" ");
 }
 
+const RELEVANCE_STOPWORDS = new Set([
+  "the", "and", "for", "with", "from", "that", "how", "what", "why", "when",
+  "are", "was", "were", "you", "your", "this", "its", "them", "they", "about",
+  "into", "which", "their", "there", "where", "will", "would", "can", "could",
+  "does", "over", "under", "also", "much", "many", "more", "than", "then",
+  "his", "her", "him", "who", "but", "not", "via", "per", "etc",
+]);
+
 export function computeRelevance(
   text: string,
   title: string,
   snippet: string,
   topicKws: ReadonlyArray<string>,
+  query?: string,
 ): number {
   if (topicKws.length === 0) return 0.5;
 
   const lowerText = text.toLowerCase();
-  const lowerTitle = title.toLowerCase();
-  const lowerSnippet = snippet.toLowerCase();
+  const lowerHaystack = `${text} ${title} ${snippet}`.toLowerCase();
   const lowerKws = topicKws.map((k) => k.toLowerCase());
 
-  // Count primary topic keyword occurrences
+  // Core-term match ratio contributes 0.0-0.6. At least one core term is still
+  // required so a completely unrelated page cannot score.
   const matchedKws = lowerKws.filter((kw) => lowerText.includes(kw));
-  if (matchedKws.length === 0) return 0.0; // Immediate reject if zero core keywords match
+  if (matchedKws.length === 0) return 0.0;
+  const coreScore = 0.6 * (matchedKws.length / lowerKws.length);
 
-  // A single generic shared keyword (e.g. "evidence") must not admit an
-  // off-topic source. Require a minimum fraction of the distinctive keyword
-  // set to actually appear in the page body.
-  const required = Math.max(1, Math.ceil(lowerKws.length * RELEVANCE_KEYWORD_MIN_FRACTION));
-  if (matchedKws.length < required) return 0.0;
+  // Full query / dimension-term overlap contributes 0.0-0.4. This distributes
+  // scores instead of clamping every on-topic page to 1.00.
+  const queryTerms = new Set(
+    (query ?? "")
+      .toLowerCase()
+      .split(/[^a-z0-9]+/)
+      .filter(
+        (term) => term.length > 2 && !RELEVANCE_STOPWORDS.has(term),
+      ),
+  );
+  const queryMatches =
+    queryTerms.size === 0
+      ? 0
+      : [...queryTerms].filter((term) => lowerHaystack.includes(term)).length;
+  const queryScore =
+    queryTerms.size === 0
+      ? 0
+      : 0.4 * (queryMatches / queryTerms.size);
 
-  let score = matchedKws.length / lowerKws.length;
-
-  // Heavy weighting for title and snippet matches
-  const titleMatches = lowerKws.filter((kw) => lowerTitle.includes(kw)).length;
-  score += (titleMatches / lowerKws.length) * RELEVANCE_TITLE_BONUS;
-
-  const snippetMatches = lowerKws.filter((kw) => lowerSnippet.includes(kw)).length;
-  score += (snippetMatches / lowerKws.length) * RELEVANCE_SNIPPET_BONUS;
+  let score = coreScore + queryScore;
 
   // Penalize off-topic noise keywords (e.g., LLMs, SEO linkfarms, gaming streams)
   const noiseTerms = ["subscribe", "newsletter", "discord", "livestream", "affiliate link", "chatgpt", "large language model"];
@@ -367,5 +380,6 @@ export function computeRelevance(
   const urlCount = (text.match(/https?:\/\/[^\s)]+/g) || []).length;
   if (urlCount / Math.max(1, wordCount) > 0.05) score *= 0.4;
 
-  return Math.min(1, Math.max(0, score));
+  // Keep a realistic ceiling; 1.00 was masking any ranking distinction.
+  return Math.min(0.92, Math.max(0, score));
 }

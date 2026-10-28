@@ -212,6 +212,45 @@ export const SEARCH_RESULTS_DEFAULT = 10;
 export const EXTRA_ENGINE_MAX_RESULTS = 24;
 
 // ---------------------------------------------------------------------------
+// Search-routing hardening
+// ---------------------------------------------------------------------------
+/** One local SearXNG query must settle within this window (was 30s). */
+export const SEARXNG_QUERY_TIMEOUT_MS = 12_000;
+/** Maximum concurrent requests to the local SearXNG instance. */
+export const SEARXNG_MAX_CONCURRENCY = 2;
+/** Deterministic/worker queries never exceed this many keywords. */
+export const MAX_GENERATED_QUERY_WORDS = 8;
+/** Standard depth: active gap workers are capped to this many. */
+export const STANDARD_MAX_GAP_WORKERS = 5;
+/** Standard depth: queries per active gap worker. */
+export const STANDARD_MAX_GAP_QUERIES = 2;
+/** DDG is circuit-broken after this many consecutive empty/blocked results. */
+export const DDG_MAX_CONSECUTIVE_FAILURES = 2;
+/** A 202/rate-limit block disables DDG for the rest of the run. */
+export const DDG_RATE_LIMIT_COOLDOWN_MS = 6 * 60 * 60 * 1000;
+
+// ---------------------------------------------------------------------------
+// Source diversity / fetch guards
+// ---------------------------------------------------------------------------
+/** Max accepted pages from one host per worker. */
+export const MAX_PAGES_PER_HOST_PER_WORKER = 2;
+/** Max accepted pages from one host across the whole run. */
+export const MAX_PAGES_PER_HOST_GLOBAL = 3;
+/** Standard/shallow runs only spider one level and only below this source count. */
+export const MAX_LINK_FOLLOW_SOURCES_STANDARD = 4;
+
+// ---------------------------------------------------------------------------
+// Layer short-circuiting
+// ---------------------------------------------------------------------------
+/** Skip a worker in later layers once it has this fraction of its page budget. */
+export const LAYER_WORKER_BUDGET_FRACTION = 0.5;
+/** Exit the layer loop after SearXNG once this many sources exist. */
+export const LAYER_EARLY_EXIT_MIN_SOURCES = 12;
+/** Or when this fraction of workers has >= 2 sources. */
+export const LAYER_EARLY_EXIT_COVERAGE_FRACTION = 0.75;
+export const LAYER_COVERAGE_MIN_SOURCES_PER_WORKER = 2;
+
+// ---------------------------------------------------------------------------
 // Qwen reasoning hardening: evidence-chunk bounding + heuristic pre-filter
 // ---------------------------------------------------------------------------
 /** Hard cap on a single evidence chunk fed to the LLM (~1,500 tokens). */
